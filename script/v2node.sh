@@ -6,6 +6,9 @@ yellow='\033[0;33m'
 plain='\033[0m'
 
 cur_dir=$(pwd)
+REPO_SLUG="YeJianbo/v2node"
+SCRIPT_BRANCH="main"
+SCRIPT_BASE_URL="https://raw.githubusercontent.com/${REPO_SLUG}/${SCRIPT_BRANCH}/script"
 
 # check root
 [[ $EUID -ne 0 ]] && echo -e "${red}错误：${plain} 必须使用root用户运行此脚本！\n" && exit 1
@@ -107,7 +110,7 @@ before_show_menu() {
 }
 
 install() {
-    bash <(curl -Ls https://raw.githubusercontent.com/wyx2685/v2node/master/script/install.sh)
+    bash <(curl -Ls ${SCRIPT_BASE_URL}/install.sh)
     if [[ $? == 0 ]]; then
         if [[ $# == 0 ]]; then
             start
@@ -123,7 +126,7 @@ update() {
     else
         version=$2
     fi
-    bash <(curl -Ls https://raw.githubusercontent.com/wyx2685/v2node/master/script/install.sh) $version
+    bash <(curl -Ls ${SCRIPT_BASE_URL}/install.sh) $version
     if [[ $? == 0 ]]; then
         echo -e "${green}更新完成，已自动重启 v2node，请使用 v2node log 查看运行日志${plain}"
         exit
@@ -307,7 +310,7 @@ show_log() {
 }
 
 update_shell() {
-    wget -O /usr/bin/v2node -N --no-check-certificate https://raw.githubusercontent.com/wyx2685/v2node/master/script/v2node.sh
+    wget -O /usr/bin/v2node -N --no-check-certificate ${SCRIPT_BASE_URL}/v2node.sh
     if [[ $? != 0 ]]; then
         echo ""
         echo -e "${red}下载脚本失败，请检查本机能否连接 Github${plain}"
@@ -424,9 +427,42 @@ generate_v2node_config() {
         local api_host="$1"
         local node_id="$2"
         local api_key="$3"
+        local config_file="/etc/v2node/config.json"
+        local action="生成"
+
+        if ! [[ "$node_id" =~ ^[0-9]+$ ]]; then
+            echo -e "${red}节点ID必须为整数${plain}"
+            return 1
+        fi
 
         mkdir -p /etc/v2node >/dev/null 2>&1
-        cat > /etc/v2node/config.json <<EOF
+        if [[ -f "$config_file" ]]; then
+            local tmp_file
+            tmp_file=$(mktemp)
+            if ! jq empty "$config_file" >/dev/null 2>&1; then
+                echo -e "${red}现有配置文件不是合法 JSON，已停止追加节点，请先检查 ${config_file}${plain}"
+                rm -f "$tmp_file"
+                return 1
+            fi
+            if ! jq \
+                --arg api_host "$api_host" \
+                --argjson node_id "$node_id" \
+                --arg api_key "$api_key" \
+                '.Nodes = ((if (.Nodes | type) == "array" then .Nodes else [] end) + [{
+                    "ApiHost": $api_host,
+                    "NodeID": $node_id,
+                    "ApiKey": $api_key,
+                    "Timeout": 15
+                }])' \
+                "$config_file" > "$tmp_file"; then
+                echo -e "${red}追加节点到配置文件失败${plain}"
+                rm -f "$tmp_file"
+                return 1
+            fi
+            mv "$tmp_file" "$config_file"
+            action="追加"
+        else
+        cat > "$config_file" <<EOF
 {
     "Log": {
         "Level": "warning",
@@ -443,7 +479,8 @@ generate_v2node_config() {
     ]
 }
 EOF
-        echo -e "${green}V2node 配置文件生成完成,正在重新启动服务${plain}"
+        fi
+        echo -e "${green}V2node 配置文件${action}完成,正在重新启动服务${plain}"
         if [[ x"${release}" == x"alpine" ]]; then
             service v2node restart
         else
@@ -513,7 +550,7 @@ show_usage() {
 show_menu() {
     echo -e "
   ${green}v2node 后端管理脚本，${plain}${red}不适用于docker${plain}
---- https://github.com/wyx2685/v2node ---
+--- https://github.com/YeJianbo/v2node ---
   ${green}0.${plain} 修改配置
 ————————————————
   ${green}1.${plain} 安装 v2node

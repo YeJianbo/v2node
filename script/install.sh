@@ -6,6 +6,10 @@ yellow='\033[0;33m'
 plain='\033[0m'
 
 cur_dir=$(pwd)
+REPO_SLUG="YeJianbo/v2node"
+UPSTREAM_REPO_SLUG="wyx2685/v2node"
+SCRIPT_BRANCH="main"
+SCRIPT_BASE_URL="https://raw.githubusercontent.com/${REPO_SLUG}/${SCRIPT_BRANCH}/script"
 
 # check root
 [[ $EUID -ne 0 ]] && echo -e "${red}错误：${plain} 必须使用root用户运行此脚本！\n" && exit 1
@@ -176,23 +180,23 @@ install_base() {
             echo "安装 EPEL 源..."
             yum install -y epel-release >/dev/null 2>&1
         fi
-        need_install_yum wget curl unzip tar cronie socat ca-certificates pv
+        need_install_yum wget curl unzip tar cronie socat ca-certificates pv jq
         update-ca-trust force-enable >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"alpine" ]]; then
-        need_install_apk wget curl unzip tar socat ca-certificates pv
+        need_install_apk wget curl unzip tar socat ca-certificates pv jq
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"debian" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates pv
+        need_install_apt wget curl unzip tar cron socat ca-certificates pv jq
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"ubuntu" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates pv
+        need_install_apt wget curl unzip tar cron socat ca-certificates pv jq
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"arch" ]]; then
         echo "更新包数据库..."
         pacman -Sy --noconfirm >/dev/null 2>&1
         # --needed 会跳过已安装的包，非常高效
         echo "安装必需的包..."
-        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates pv >/dev/null 2>&1
+        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates pv jq >/dev/null 2>&1
     fi
 }
 
@@ -222,9 +226,42 @@ generate_v2node_config() {
         local api_host="$1"
         local node_id="$2"
         local api_key="$3"
+        local config_file="/etc/v2node/config.json"
+        local action="生成"
+
+        if ! [[ "$node_id" =~ ^[0-9]+$ ]]; then
+            echo -e "${red}节点ID必须为整数${plain}"
+            return 1
+        fi
 
         mkdir -p /etc/v2node >/dev/null 2>&1
-        cat > /etc/v2node/config.json <<EOF
+        if [[ -f "$config_file" ]]; then
+            local tmp_file
+            tmp_file=$(mktemp)
+            if ! jq empty "$config_file" >/dev/null 2>&1; then
+                echo -e "${red}现有配置文件不是合法 JSON，已停止追加节点，请先检查 ${config_file}${plain}"
+                rm -f "$tmp_file"
+                return 1
+            fi
+            if ! jq \
+                --arg api_host "$api_host" \
+                --argjson node_id "$node_id" \
+                --arg api_key "$api_key" \
+                '.Nodes = ((if (.Nodes | type) == "array" then .Nodes else [] end) + [{
+                    "ApiHost": $api_host,
+                    "NodeID": $node_id,
+                    "ApiKey": $api_key,
+                    "Timeout": 15
+                }])' \
+                "$config_file" > "$tmp_file"; then
+                echo -e "${red}追加节点到配置文件失败${plain}"
+                rm -f "$tmp_file"
+                return 1
+            fi
+            mv "$tmp_file" "$config_file"
+            action="追加"
+        else
+        cat > "$config_file" <<EOF
 {
     "Log": {
         "Level": "warning",
@@ -241,7 +278,8 @@ generate_v2node_config() {
     ]
 }
 EOF
-        echo -e "${green}V2node 配置文件生成完成,正在重新启动服务${plain}"
+        fi
+        echo -e "${green}V2node 配置文件${action}完成,正在重新启动服务${plain}"
         if [[ x"${release}" == x"alpine" ]]; then
             service v2node restart
         else
@@ -257,8 +295,22 @@ EOF
         fi
 }
 
+get_latest_release_tag() {
+    local repo_slug="$1"
+    curl -fsLs "https://api.github.com/repos/${repo_slug}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
+download_release_zip() {
+    local repo_slug="$1"
+    local version="$2"
+    local url="https://github.com/${repo_slug}/releases/download/${version}/v2node-linux-${arch}.zip"
+
+    curl -fLsS "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
+}
+
 install_v2node() {
     local version_param="$1"
+    local release_repo="$REPO_SLUG"
     if [[ -e /usr/local/v2node/ ]]; then
         rm -rf /usr/local/v2node/
     fi
@@ -267,25 +319,36 @@ install_v2node() {
     cd /usr/local/v2node/
 
     if  [[ -z "$version_param" ]] ; then
-        last_version=$(curl -Ls "https://api.github.com/repos/wyx2685/v2node/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        last_version=$(get_latest_release_tag "$release_repo")
+        if [[ ! -n "$last_version" ]]; then
+            echo -e "${yellow}你的 fork 暂无可用 release，回退到上游 release 源${plain}"
+            release_repo="$UPSTREAM_REPO_SLUG"
+            last_version=$(get_latest_release_tag "$release_repo")
+        fi
         if [[ ! -n "$last_version" ]]; then
             echo -e "${red}检测 v2node 版本失败，可能是超出 Github API 限制，请稍后再试，或手动指定 v2node 版本安装${plain}"
             exit 1
         fi
         echo -e "${green}检测到最新版本：${last_version}，开始安装...${plain}"
-        url="https://github.com/wyx2685/v2node/releases/download/${last_version}/v2node-linux-${arch}.zip"
-        curl -sL "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
-        if [[ $? -ne 0 ]]; then
+        if ! download_release_zip "$release_repo" "$last_version"; then
+            if [[ "$release_repo" != "$UPSTREAM_REPO_SLUG" ]]; then
+                echo -e "${yellow}从你的 fork 下载 release 失败，回退到上游 release 源${plain}"
+                release_repo="$UPSTREAM_REPO_SLUG"
+            fi
+            if ! download_release_zip "$release_repo" "$last_version"; then
             echo -e "${red}下载 v2node 失败，请确保你的服务器能够下载 Github 的文件${plain}"
             exit 1
+            fi
         fi
     else
-    last_version=$version_param
-        url="https://github.com/wyx2685/v2node/releases/download/${last_version}/v2node-linux-${arch}.zip"
-        curl -sL "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}下载 v2node $1 失败，请确保此版本存在${plain}"
-            exit 1
+        last_version=$version_param
+        if ! download_release_zip "$release_repo" "$last_version"; then
+            echo -e "${yellow}你的 fork 中不存在版本 ${last_version}，回退到上游 release 源${plain}"
+            release_repo="$UPSTREAM_REPO_SLUG"
+            if ! download_release_zip "$release_repo" "$last_version"; then
+                echo -e "${red}下载 v2node $1 失败，请确保此版本存在${plain}"
+                exit 1
+            fi
         fi
     fi
 
@@ -358,24 +421,31 @@ EOF
             first_install=true
         fi
     else
-        if [[ x"${release}" == x"alpine" ]]; then
-            service v2node start
+        if [[ -n "$API_HOST_ARG" && -n "$NODE_ID_ARG" && -n "$API_KEY_ARG" ]]; then
+            if ! generate_v2node_config "$API_HOST_ARG" "$NODE_ID_ARG" "$API_KEY_ARG"; then
+                exit 1
+            fi
+            echo -e "${green}检测到现有安装，已向 /etc/v2node/config.json 追加一个节点${plain}"
         else
-            systemctl start v2node
-        fi
-        sleep 2
-        check_status
-        echo -e ""
-        if [[ $? == 0 ]]; then
-            echo -e "${green}v2node 重启成功${plain}"
-        else
-            echo -e "${red}v2node 可能启动失败，请使用 v2node log 查看日志信息${plain}"
+            if [[ x"${release}" == x"alpine" ]]; then
+                service v2node start
+            else
+                systemctl start v2node
+            fi
+            sleep 2
+            check_status
+            echo -e ""
+            if [[ $? == 0 ]]; then
+                echo -e "${green}v2node 重启成功${plain}"
+            else
+                echo -e "${red}v2node 可能启动失败，请使用 v2node log 查看日志信息${plain}"
+            fi
         fi
         first_install=false
     fi
 
 
-    curl -o /usr/bin/v2node -Ls https://raw.githubusercontent.com/wyx2685/v2node/main/script/v2node.sh
+    curl -o /usr/bin/v2node -Ls ${SCRIPT_BASE_URL}/v2node.sh
     chmod +x /usr/bin/v2node
 
     cd $cur_dir
