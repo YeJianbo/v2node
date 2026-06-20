@@ -110,7 +110,7 @@ before_show_menu() {
 }
 
 install() {
-    bash <(curl -Ls ${SCRIPT_BASE_URL}/install.sh)
+    bash <(curl -Ls "${SCRIPT_BASE_URL}/install.sh")
     if [[ $? == 0 ]]; then
         if [[ $# == 0 ]]; then
             start
@@ -126,7 +126,7 @@ update() {
     else
         version=$2
     fi
-    bash <(curl -Ls ${SCRIPT_BASE_URL}/install.sh) $version
+    bash <(curl -Ls "${SCRIPT_BASE_URL}/install.sh") $version
     if [[ $? == 0 ]]; then
         echo -e "${green}更新完成，已自动重启 v2node，请使用 v2node log 查看运行日志${plain}"
         exit
@@ -169,16 +169,23 @@ uninstall() {
         return 0
     fi
     if [[ x"${release}" == x"alpine" ]]; then
+        service v2node-probe stop >/dev/null 2>&1 || true
+        rc-update del v2node-probe default >/dev/null 2>&1 || true
+        rm /etc/init.d/v2node-probe -f
         service v2node stop
         rc-update del v2node
         rm /etc/init.d/v2node -f
     else
+        systemctl stop v2node-probe >/dev/null 2>&1 || true
+        systemctl disable v2node-probe >/dev/null 2>&1 || true
+        rm /etc/systemd/system/v2node-probe.service -f
         systemctl stop v2node
         systemctl disable v2node
         rm /etc/systemd/system/v2node.service -f
         systemctl daemon-reload
         systemctl reset-failed
     fi
+    rm /etc/v2node/probe.env -f
     rm /etc/v2node/ -rf
     rm /usr/local/v2node/ -rf
 
@@ -310,7 +317,7 @@ show_log() {
 }
 
 update_shell() {
-    wget -O /usr/bin/v2node -N --no-check-certificate ${SCRIPT_BASE_URL}/v2node.sh
+    wget -O /usr/bin/v2node -N --no-check-certificate "${SCRIPT_BASE_URL}/v2node.sh"
     if [[ $? != 0 ]]; then
         echo ""
         echo -e "${red}下载脚本失败，请检查本机能否连接 Github${plain}"
@@ -439,6 +446,11 @@ generate_v2node_config() {
         if [[ -f "$config_file" ]]; then
             local tmp_file
             tmp_file=$(mktemp)
+            if ! command -v jq >/dev/null 2>&1; then
+                echo -e "${red}当前系统缺少 jq，无法追加节点，请先执行 v2node update 或手动安装 jq${plain}"
+                rm -f "$tmp_file"
+                return 1
+            fi
             if ! jq empty "$config_file" >/dev/null 2>&1; then
                 echo -e "${red}现有配置文件不是合法 JSON，已停止追加节点，请先检查 ${config_file}${plain}"
                 rm -f "$tmp_file"
@@ -496,6 +508,14 @@ EOF
         fi
 }
 
+probe_sync() {
+    if [[ ! -x /usr/local/v2node/v2node-probe.sh ]]; then
+        echo -e "${red}未找到探针同步脚本${plain}"
+        return 1
+    fi
+    /usr/local/v2node/v2node-probe.sh sync
+}
+
 
 generate_config_file() {
     # 交互式收集参数，提供示例默认值
@@ -539,6 +559,7 @@ show_usage() {
     echo "v2node log          - 查看 v2node 日志"
     echo "v2node x25519       - 生成 x25519 密钥"
     echo "v2node generate     - 生成 v2node 配置文件"
+    echo "v2node probe_sync   - 立即同步探针配置"
     echo "v2node update       - 更新 v2node"
     echo "v2node update x.x.x - 安装 v2node 指定版本"
     echo "v2node install      - 安装 v2node"
@@ -569,12 +590,13 @@ show_menu() {
   ${green}11.${plain} 查看 v2node 版本
   ${green}12.${plain} 升级 v2node 维护脚本
   ${green}13.${plain} 生成 v2node 配置文件
-  ${green}14.${plain} 放行 VPS 的所有网络端口
-  ${green}15.${plain} 退出脚本
+  ${green}14.${plain} 立即同步探针配置
+  ${green}15.${plain} 放行 VPS 的所有网络端口
+  ${green}16.${plain} 退出脚本
  "
  #后续更新可加入上方字符串中
     show_status
-    echo && read -rp "请输入选择 [0-15]: " num
+    echo && read -rp "请输入选择 [0-16]: " num
 
     case "${num}" in
         0) config ;;
@@ -591,9 +613,10 @@ show_menu() {
         11) check_install && show_v2node_version ;;
         12) update_shell ;;
         13) generate_config_file ;;
-        14) open_ports ;;
-        15) exit ;;
-        *) echo -e "${red}请输入正确的数字 [0-15]${plain}" ;;
+        14) probe_sync ;;
+        15) open_ports ;;
+        16) exit ;;
+        *) echo -e "${red}请输入正确的数字 [0-16]${plain}" ;;
     esac
 }
 
@@ -610,6 +633,7 @@ if [[ $# > 0 ]]; then
         "update") check_install 0 && update 0 $2 ;;
         "config") config $* ;;
         "generate") generate_config_file ;;
+        "probe_sync") probe_sync ;;
         "install") check_uninstall 0 && install 0 ;;
         "uninstall") check_install 0 && uninstall 0 ;;
         "version") check_install 0 && show_v2node_version 0 ;;

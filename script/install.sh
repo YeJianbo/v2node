@@ -44,6 +44,10 @@ VERSION_ARG=""
 API_HOST_ARG=""
 NODE_ID_ARG=""
 API_KEY_ARG=""
+INSTALL_MODE_ARG="node"
+PANEL_URL_ARG=""
+MACHINE_TOKEN_ARG=""
+MACHINE_ID_ARG=""
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -54,8 +58,16 @@ parse_args() {
                 NODE_ID_ARG="$2"; shift 2 ;;
             --api-key)
                 API_KEY_ARG="$2"; shift 2 ;;
+            --mode)
+                INSTALL_MODE_ARG="$2"; shift 2 ;;
+            --panel)
+                PANEL_URL_ARG="$2"; shift 2 ;;
+            --token)
+                MACHINE_TOKEN_ARG="$2"; shift 2 ;;
+            --machine-id)
+                MACHINE_ID_ARG="$2"; shift 2 ;;
             -h|--help)
-                echo "用法: $0 [版本号] [--api-host URL] [--node-id ID] [--api-key KEY]"
+                echo "用法: $0 [版本号] [--api-host URL] [--node-id ID] [--api-key KEY] [--mode node|machine] [--panel URL] [--token TOKEN] [--machine-id ID]"
                 exit 0 ;;
             --*)
                 echo "未知参数: $1"; exit 1 ;;
@@ -180,23 +192,23 @@ install_base() {
             echo "安装 EPEL 源..."
             yum install -y epel-release >/dev/null 2>&1
         fi
-        need_install_yum wget curl unzip tar cronie socat ca-certificates pv jq
+        need_install_yum wget curl unzip tar cronie socat ca-certificates pv jq openssl
         update-ca-trust force-enable >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"alpine" ]]; then
-        need_install_apk wget curl unzip tar socat ca-certificates pv jq
+        need_install_apk wget curl unzip tar socat ca-certificates pv jq openssl
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"debian" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates pv jq
+        need_install_apt wget curl unzip tar cron socat ca-certificates pv jq openssl
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"ubuntu" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates pv jq
+        need_install_apt wget curl unzip tar cron socat ca-certificates pv jq openssl
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"arch" ]]; then
         echo "更新包数据库..."
         pacman -Sy --noconfirm >/dev/null 2>&1
         # --needed 会跳过已安装的包，非常高效
         echo "安装必需的包..."
-        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates pv jq >/dev/null 2>&1
+        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates pv jq openssl >/dev/null 2>&1
     fi
 }
 
@@ -238,6 +250,11 @@ generate_v2node_config() {
         if [[ -f "$config_file" ]]; then
             local tmp_file
             tmp_file=$(mktemp)
+            if ! command -v jq >/dev/null 2>&1; then
+                echo -e "${red}当前系统缺少 jq，无法追加节点，请先执行 v2node update 或手动安装 jq${plain}"
+                rm -f "$tmp_file"
+                return 1
+            fi
             if ! jq empty "$config_file" >/dev/null 2>&1; then
                 echo -e "${red}现有配置文件不是合法 JSON，已停止追加节点，请先检查 ${config_file}${plain}"
                 rm -f "$tmp_file"
@@ -336,8 +353,8 @@ install_v2node() {
                 release_repo="$UPSTREAM_REPO_SLUG"
             fi
             if ! download_release_zip "$release_repo" "$last_version"; then
-            echo -e "${red}下载 v2node 失败，请确保你的服务器能够下载 Github 的文件${plain}"
-            exit 1
+                echo -e "${red}下载 v2node 失败，请确保你的服务器能够下载 Github 的文件${plain}"
+                exit 1
             fi
         fi
     else
@@ -358,6 +375,11 @@ install_v2node() {
     mkdir /etc/v2node/ -p
     cp geoip.dat /etc/v2node/
     cp geosite.dat /etc/v2node/
+    if ! curl -fsSL "${SCRIPT_BASE_URL}/v2node-probe.sh" -o /usr/local/v2node/v2node-probe.sh; then
+        echo -e "${red}下载探针同步脚本失败${plain}"
+        exit 1
+    fi
+    chmod +x /usr/local/v2node/v2node-probe.sh
     if [[ x"${release}" == x"alpine" ]]; then
         rm /etc/init.d/v2node -f
         cat <<EOF > /etc/init.d/v2node
@@ -410,7 +432,12 @@ EOF
         echo -e "${green}v2node ${last_version}${plain} 安装完成，已设置开机自启"
     fi
 
-    if [[ ! -f /etc/v2node/config.json ]]; then
+    disable_machine_probe
+
+    if [[ "$INSTALL_MODE_ARG" == "machine" ]]; then
+        setup_machine_probe
+        first_install=false
+    elif [[ ! -f /etc/v2node/config.json ]]; then
         # 如果通过 CLI 传入了完整参数，则直接生成配置并跳过交互
         if [[ -n "$API_HOST_ARG" && -n "$NODE_ID_ARG" && -n "$API_KEY_ARG" ]]; then
             generate_v2node_config "$API_HOST_ARG" "$NODE_ID_ARG" "$API_KEY_ARG"
@@ -445,7 +472,7 @@ EOF
     fi
 
 
-    curl -o /usr/bin/v2node -Ls ${SCRIPT_BASE_URL}/v2node.sh
+    curl -o /usr/bin/v2node -Ls "${SCRIPT_BASE_URL}/v2node.sh"
     chmod +x /usr/bin/v2node
 
     cd $cur_dir
@@ -470,7 +497,9 @@ EOF
     echo "------------------------------------------"
     curl -fsS --max-time 10 "https://api.v-50.me/counter" || true
 
-    if [[ $first_install == true ]]; then
+    if [[ "$INSTALL_MODE_ARG" == "machine" ]]; then
+        echo -e "${green}已启用探针模式。后续在面板为该在线服务器分配 v2node 节点后，会自动同步到本机。${plain}"
+    elif [[ $first_install == true ]]; then
         read -rp "检测到你为第一次安装 v2node，是否自动生成 /etc/v2node/config.json？(y/n): " if_generate
         if [[ "$if_generate" =~ ^[Yy]$ ]]; then
             # 交互式收集参数，提供示例默认值
@@ -485,6 +514,110 @@ EOF
         else
             echo "${green}已跳过自动生成配置。如需后续生成，可执行: v2node generate${plain}"
         fi
+    fi
+}
+
+disable_machine_probe() {
+    rm -f /etc/v2node/probe.env
+    if [[ x"${release}" == x"alpine" ]]; then
+        if [[ -f /etc/init.d/v2node-probe ]]; then
+            service v2node-probe stop >/dev/null 2>&1 || true
+            rc-update del v2node-probe default >/dev/null 2>&1 || true
+            rm -f /etc/init.d/v2node-probe
+        fi
+    else
+        if [[ -f /etc/systemd/system/v2node-probe.service ]]; then
+            systemctl stop v2node-probe >/dev/null 2>&1 || true
+            systemctl disable v2node-probe >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/v2node-probe.service
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+setup_machine_probe() {
+    if [[ -z "$PANEL_URL_ARG" || -z "$MACHINE_TOKEN_ARG" || -z "$MACHINE_ID_ARG" ]]; then
+        echo -e "${red}探针模式缺少 --panel、--token 或 --machine-id 参数${plain}"
+        exit 1
+    fi
+
+    local panel_url="${PANEL_URL_ARG%/}"
+    local backup_file=""
+
+    mkdir -p /etc/v2node
+    if [[ -f /etc/v2node/config.json ]]; then
+        backup_file="/etc/v2node/config.manual.backup.$(date +%Y%m%d%H%M%S).json"
+        cp /etc/v2node/config.json "$backup_file"
+    fi
+
+    cat > /etc/v2node/probe.env <<EOF
+PANEL_URL='${panel_url}'
+MACHINE_TOKEN='${MACHINE_TOKEN_ARG}'
+MACHINE_ID='${MACHINE_ID_ARG}'
+SYNC_INTERVAL='15'
+EOF
+
+    cat > /etc/v2node/config.json <<EOF
+{
+    "Log": {
+        "Level": "warning",
+        "Output": "",
+        "Access": "none"
+    },
+    "Nodes": []
+}
+EOF
+
+    if [[ x"${release}" == x"alpine" ]]; then
+        cat <<EOF > /etc/init.d/v2node-probe
+#!/sbin/openrc-run
+
+name="v2node-probe"
+description="v2node probe sync service"
+
+command="/usr/local/v2node/v2node-probe.sh"
+command_args="daemon"
+command_user="root"
+pidfile="/run/v2node-probe.pid"
+command_background="yes"
+
+depend() {
+    need net
+}
+EOF
+        chmod +x /etc/init.d/v2node-probe
+        rc-update add v2node-probe default >/dev/null 2>&1 || true
+        service v2node-probe restart >/dev/null 2>&1 || service v2node-probe start >/dev/null 2>&1
+        service v2node start >/dev/null 2>&1 || true
+    else
+        cat <<EOF > /etc/systemd/system/v2node-probe.service
+[Unit]
+Description=v2node Probe Sync Service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/v2node/v2node-probe.sh daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable v2node >/dev/null 2>&1 || true
+        systemctl enable v2node-probe >/dev/null 2>&1 || true
+        systemctl restart v2node >/dev/null 2>&1 || systemctl start v2node >/dev/null 2>&1
+        systemctl restart v2node-probe >/dev/null 2>&1 || systemctl start v2node-probe >/dev/null 2>&1
+    fi
+
+    /usr/local/v2node/v2node-probe.sh sync >/dev/null 2>&1 || true
+
+    if [[ -n "$backup_file" ]]; then
+        echo -e "${yellow}已将原有手工配置备份到: ${backup_file}${plain}"
     fi
 }
 
