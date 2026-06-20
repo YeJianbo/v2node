@@ -48,6 +48,8 @@ INSTALL_MODE_ARG="node"
 PANEL_URL_ARG=""
 MACHINE_TOKEN_ARG=""
 MACHINE_ID_ARG=""
+ENROLL_TOKEN_ARG=""
+MACHINE_NAME_ARG=""
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -66,8 +68,12 @@ parse_args() {
                 MACHINE_TOKEN_ARG="$2"; shift 2 ;;
             --machine-id)
                 MACHINE_ID_ARG="$2"; shift 2 ;;
+            --enroll-token)
+                ENROLL_TOKEN_ARG="$2"; shift 2 ;;
+            --machine-name)
+                MACHINE_NAME_ARG="$2"; shift 2 ;;
             -h|--help)
-                echo "用法: $0 [版本号] [--api-host URL] [--node-id ID] [--api-key KEY] [--mode node|machine] [--panel URL] [--token TOKEN] [--machine-id ID]"
+                echo "用法: $0 [版本号] [--api-host URL] [--node-id ID] [--api-key KEY] [--mode node|machine] [--panel URL] [--token TOKEN] [--machine-id ID] [--enroll-token TOKEN] [--machine-name NAME]"
                 exit 0 ;;
             --*)
                 echo "未知参数: $1"; exit 1 ;;
@@ -535,14 +541,109 @@ disable_machine_probe() {
     fi
 }
 
+escape_env_value() {
+    printf "%s" "$1" | sed "s/'/'\"'\"'/g"
+}
+
+detect_machine_name() {
+    if [[ -n "$MACHINE_NAME_ARG" ]]; then
+        printf "%s" "$MACHINE_NAME_ARG"
+        return
+    fi
+
+    hostname -f 2>/dev/null || hostname 2>/dev/null || printf "v2node-probe"
+}
+
+detect_primary_ip() {
+    local ip
+    ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '
+        /^127\./ { next }
+        /^169\.254\./ { next }
+        /^172\.(1[6-9]|2[0-9]|3[0-1])\./ { next }
+        /^198\.18\./ { next }
+        /^198\.19\./ { next }
+        /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }
+    ')
+    if [[ -n "$ip" ]]; then
+        printf "%s" "$ip"
+        return
+    fi
+
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
+    if [[ -n "$ip" ]]; then
+        printf "%s" "$ip"
+        return
+    fi
+
+    hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+enroll_machine_probe() {
+    if [[ -z "$ENROLL_TOKEN_ARG" ]]; then
+        return 0
+    fi
+
+    local panel_url="${PANEL_URL_ARG%/}"
+    local machine_name
+    local machine_host
+    local body
+    local response
+    local api_token
+    local machine_id
+
+    if [[ -z "$panel_url" ]]; then
+        echo -e "${red}探针通用接入缺少 --panel 参数${plain}"
+        exit 1
+    fi
+
+    machine_name=$(detect_machine_name)
+    machine_host=$(detect_primary_ip)
+    body=$(jq -nc \
+        --arg enroll_token "$ENROLL_TOKEN_ARG" \
+        --arg name "$machine_name" \
+        --arg host "$machine_host" \
+        --arg machine_id "$MACHINE_ID_ARG" \
+        '{
+            enroll_token:$enroll_token,
+            name:$name,
+            host:$host
+        } + (if ($machine_id | length) > 0 then {machine_id:($machine_id | tonumber)} else {} end)')
+
+    echo -e "${green}正在向面板注册探针: ${panel_url}${plain}"
+    if ! response=$(curl -fsSL --connect-timeout 8 --max-time 20 \
+        -H "Content-Type: application/json" \
+        -H "Connection: close" \
+        --data "$body" \
+        "${panel_url}/api/v1/server/machine/enroll"); then
+        echo -e "${red}探针注册失败，请检查面板地址和通用接入令牌${plain}"
+        exit 1
+    fi
+
+    machine_id=$(printf "%s" "$response" | jq -r '.data.machine_id // .data.id // ""')
+    api_token=$(printf "%s" "$response" | jq -r '.data.api_token // .data.token // ""')
+    if [[ -z "$machine_id" || -z "$api_token" || "$machine_id" == "null" || "$api_token" == "null" ]]; then
+        echo -e "${red}探针注册响应无效: ${response}${plain}"
+        exit 1
+    fi
+
+    MACHINE_ID_ARG="$machine_id"
+    MACHINE_TOKEN_ARG="$api_token"
+}
+
 setup_machine_probe() {
+    enroll_machine_probe
+
     if [[ -z "$PANEL_URL_ARG" || -z "$MACHINE_TOKEN_ARG" || -z "$MACHINE_ID_ARG" ]]; then
-        echo -e "${red}探针模式缺少 --panel、--token 或 --machine-id 参数${plain}"
+        echo -e "${red}探针模式缺少 --panel，并且需要 --enroll-token 或 --token + --machine-id${plain}"
         exit 1
     fi
 
     local panel_url="${PANEL_URL_ARG%/}"
     local backup_file=""
+    local escaped_panel_url
+    local escaped_machine_token
+    escaped_panel_url=$(escape_env_value "$panel_url")
+    escaped_machine_token=$(escape_env_value "$MACHINE_TOKEN_ARG")
 
     mkdir -p /etc/v2node
     if [[ -f /etc/v2node/config.json ]]; then
@@ -551,8 +652,8 @@ setup_machine_probe() {
     fi
 
     cat > /etc/v2node/probe.env <<EOF
-PANEL_URL='${panel_url}'
-MACHINE_TOKEN='${MACHINE_TOKEN_ARG}'
+PANEL_URL='${escaped_panel_url}'
+MACHINE_TOKEN='${escaped_machine_token}'
 MACHINE_ID='${MACHINE_ID_ARG}'
 SYNC_INTERVAL='15'
 EOF
