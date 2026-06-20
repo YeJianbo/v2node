@@ -85,7 +85,7 @@ signed_get() {
     local curl_status=0
     local curl_error_file
     curl_error_file=$(mktemp)
-    output=$(curl -fsSL --connect-timeout 10 --max-time 20 \
+    output=$(curl -fsSL --connect-timeout 5 --max-time 8 \
         -H "X-V2Node-Machine-Id: ${MACHINE_ID}" \
         -H "X-V2Node-Timestamp: ${timestamp}" \
         -H "X-V2Node-Nonce: ${nonce}" \
@@ -122,7 +122,7 @@ signed_post_json() {
     local curl_status=0
     local curl_error_file
     curl_error_file=$(mktemp)
-    output=$(curl -fsSL --connect-timeout 10 --max-time 20 \
+    output=$(curl -fsSL --connect-timeout 5 --max-time 8 \
         -X POST \
         -H "Content-Type: application/json" \
         -H "X-V2Node-Machine-Id: ${MACHINE_ID}" \
@@ -201,16 +201,41 @@ read_net_bytes() {
     ' /proc/net/dev 2>/dev/null
 }
 
+read_primary_ip() {
+    local ip
+    ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '
+        /^127\./ { next }
+        /^169\.254\./ { next }
+        /^172\.(1[6-9]|2[0-9]|3[0-1])\./ { next }
+        /^198\.18\./ { next }
+        /^198\.19\./ { next }
+        /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }
+    ')
+    if [[ -n "$ip" ]]; then
+        printf '%s' "$ip"
+        return
+    fi
+
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
+    if [[ -n "$ip" ]]; then
+        printf '%s' "$ip"
+        return
+    fi
+
+    hostname -I 2>/dev/null | awk '{print $1}'
+}
+
 push_status() {
     load_state || return 1
     ensure_dependencies || return 1
 
-    local cpu mem disk uptime version net_rx net_tx body
+    local cpu mem disk uptime version net_rx net_tx primary_ip body
     cpu=$(read_cpu_percent)
     mem=$(read_mem_percent)
     disk=$(read_disk_percent)
     uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d'.' -f1)
     version="v2node-probe $(uname -s 2>/dev/null) $(uname -m 2>/dev/null)"
+    primary_ip=$(read_primary_ip)
     read -r net_rx net_tx <<< "$(read_net_bytes)"
 
     body=$(jq -nc \
@@ -220,8 +245,9 @@ push_status() {
         --argjson net_rx "${net_rx:-0}" \
         --argjson net_tx "${net_tx:-0}" \
         --argjson uptime "${uptime:-0}" \
+        --arg ip "$primary_ip" \
         --arg version "$version" \
-        '{cpu:$cpu, mem:$mem, disk:$disk, net_rx:$net_rx, net_tx:$net_tx, uptime:$uptime, version:$version}')
+        '{cpu:$cpu, mem:$mem, disk:$disk, net_rx:$net_rx, net_tx:$net_tx, uptime:$uptime, ip:$ip, version:$version}')
 
     signed_post_json "/api/v1/server/machine/push" "$body" >/dev/null
 }
@@ -257,6 +283,37 @@ write_config() {
     log "已更新 $CONFIG_FILE"
 }
 
+restart_v2node_service() {
+    log "收到重启 v2node 节点服务指令"
+
+    if command -v systemctl >/dev/null 2>&1 && timeout 3 systemctl list-units >/dev/null 2>&1; then
+        systemctl restart v2node
+        return $?
+    fi
+
+    if command -v service >/dev/null 2>&1 && timeout 3 service v2node status >/dev/null 2>&1; then
+        service v2node restart
+        return $?
+    fi
+
+    local pids
+    pids=$(ps -eo pid=,args= | awk '/\/usr\/local\/v2node\/v2node server/ && !/awk/ {print $1}')
+    if [[ -n "$pids" ]]; then
+        kill $pids 2>/dev/null || true
+        sleep 1
+    fi
+
+    mkdir -p /var/log
+    setsid /usr/local/v2node/v2node server >/var/log/v2node.log 2>&1 < /dev/null &
+}
+
+ack_restart_v2node() {
+    local restart_token="$1"
+    local body
+    body=$(jq -nc --arg restart_token "$restart_token" '{restart_token:$restart_token}')
+    signed_post_json "/api/v1/server/machine/restartAck" "$body" >/dev/null
+}
+
 sync_once() {
     load_state || return 1
     ensure_dependencies || return 1
@@ -270,6 +327,9 @@ sync_once() {
         fail "拉取探针配置失败: ${PANEL_URL}${api_path}"
         return 1
     fi
+
+    local restart_token
+    restart_token=$(printf '%s' "$response" | jq -r '.restart_v2node_token // ""')
 
     local nodes_json
     if ! nodes_json=$(printf '%s' "$response" | jq -c '
@@ -285,6 +345,15 @@ sync_once() {
     fi
 
     write_config "$nodes_json"
+
+    if [[ -n "$restart_token" && "$restart_token" != "null" ]]; then
+        if restart_v2node_service; then
+            ack_restart_v2node "$restart_token" || true
+        else
+            fail "重启 v2node 节点服务失败"
+            return 1
+        fi
+    fi
 }
 
 daemon_loop() {
