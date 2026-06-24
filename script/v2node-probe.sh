@@ -6,6 +6,7 @@ STATE_FILE="${V2NODE_PROBE_STATE_FILE:-/etc/v2node/probe.env}"
 CONFIG_FILE="${V2NODE_CONFIG_FILE:-/etc/v2node/config.json}"
 DDNS_STATE_FILE="${V2NODE_PROBE_DDNS_STATE_FILE:-/etc/v2node/probe-ddns.state}"
 SYNC_INTERVAL_DEFAULT=15
+CONFIG_CHANGED=0
 
 log() {
     echo "[v2node-probe] $*"
@@ -420,6 +421,7 @@ push_status() {
 write_config() {
     local nodes_json="$1"
     local tmp_file
+    CONFIG_CHANGED=0
     tmp_file=$(mktemp)
 
     if ! jq -n \
@@ -445,6 +447,7 @@ write_config() {
     fi
 
     mv "$tmp_file" "$CONFIG_FILE"
+    CONFIG_CHANGED=1
     log "已更新 $CONFIG_FILE"
 }
 
@@ -511,12 +514,24 @@ sync_once() {
         return 1
     fi
 
+    local restart_required=0
+
     sync_ddns "$ddns_json" || true
     write_config "$nodes_json"
 
+    if [[ "${CONFIG_CHANGED:-0}" == "1" ]]; then
+        restart_required=1
+    fi
+
     if [[ -n "$restart_token" && "$restart_token" != "null" ]]; then
+        restart_required=1
+    fi
+
+    if [[ "$restart_required" == "1" ]]; then
         if restart_v2node_service; then
-            ack_restart_v2node "$restart_token" || true
+            if [[ -n "$restart_token" && "$restart_token" != "null" ]]; then
+                ack_restart_v2node "$restart_token" || true
+            fi
         else
             fail "重启 v2node 节点服务失败"
             return 1
