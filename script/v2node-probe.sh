@@ -4,9 +4,14 @@ set -u
 
 STATE_FILE="${V2NODE_PROBE_STATE_FILE:-/etc/v2node/probe.env}"
 CONFIG_FILE="${V2NODE_CONFIG_FILE:-/etc/v2node/config.json}"
+MANAGED_NODES_STATE_FILE="${V2NODE_PROBE_MANAGED_NODES_STATE_FILE:-/etc/v2node/probe-managed-nodes.json}"
 DDNS_STATE_FILE="${V2NODE_PROBE_DDNS_STATE_FILE:-/etc/v2node/probe-ddns.state}"
+GOST_CONFIG_FILE="${V2NODE_PROBE_GOST_CONFIG_FILE:-/etc/gost/config.json}"
+GOST_BIN="${V2NODE_PROBE_GOST_BIN:-/usr/bin/gost}"
+GOST_VERSION="${V2NODE_PROBE_GOST_VERSION:-2.11.2}"
 SYNC_INTERVAL_DEFAULT=15
 CONFIG_CHANGED=0
+GOST_CONFIG_CHANGED=0
 
 log() {
     echo "[v2node-probe] $*"
@@ -52,6 +57,417 @@ ensure_dependencies() {
     if ! command -v openssl >/dev/null 2>&1; then
         fail "缺少 openssl"
         return 1
+    fi
+    if ! command -v gzip >/dev/null 2>&1; then
+        fail "缺少 gzip"
+        return 1
+    fi
+}
+
+detect_firewall_backend() {
+    if command -v ufw >/dev/null 2>&1; then
+        local ufw_status
+        ufw_status=$(ufw status 2>/dev/null | head -n 1 || true)
+        if printf '%s' "$ufw_status" | grep -qi '^Status: active'; then
+            printf 'ufw'
+            return
+        fi
+    fi
+
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        if firewall-cmd --state 2>/dev/null | grep -qi '^running$'; then
+            printf 'firewalld'
+            return
+        fi
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        printf 'iptables'
+        return
+    fi
+
+    printf 'none'
+}
+
+ensure_ufw_port_open() {
+    local port="$1"
+    local protocol="$2"
+
+    if ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])${port}/${protocol}([[:space:]]|$)"; then
+        return 0
+    fi
+
+    ufw allow "${port}/${protocol}" >/dev/null
+    log "已放行防火墙端口 ${port}/${protocol} (ufw)"
+}
+
+ensure_firewalld_port_open() {
+    local port="$1"
+    local protocol="$2"
+    local changed="$3"
+
+    if firewall-cmd --permanent --query-port="${port}/${protocol}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    firewall-cmd --permanent --add-port="${port}/${protocol}" >/dev/null
+    printf -v "$changed" '1'
+    log "已放行防火墙端口 ${port}/${protocol} (firewalld)"
+}
+
+ensure_iptables_port_open() {
+    local port="$1"
+    local protocol="$2"
+
+    if ! iptables -C INPUT -p "$protocol" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+        iptables -I INPUT -p "$protocol" --dport "$port" -j ACCEPT
+        log "已放行防火墙端口 ${port}/${protocol} (iptables)"
+    fi
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        if ! ip6tables -C INPUT -p "$protocol" --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+            ip6tables -I INPUT -p "$protocol" --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+sync_firewall() {
+    local firewall_json="$1"
+    local backend
+    local normalized_rules
+
+    if ! normalized_rules=$(printf '%s' "$firewall_json" | jq -c '
+        [
+            (. // [])[]?
+            | {
+                port: ((.port // 0) | tonumber),
+                protocols: (
+                    (.protocols // [])
+                    | map(ascii_downcase)
+                    | map(select(. == "tcp" or . == "udp"))
+                    | unique
+                )
+            }
+            | select(.port >= 1 and .port <= 65535)
+            | select((.protocols | length) > 0)
+        ]
+    '); then
+        fail "解析防火墙规则失败"
+        return 1
+    fi
+
+    if [[ "$(printf '%s' "$normalized_rules" | jq 'length')" -eq 0 ]]; then
+        return 0
+    fi
+
+    backend=$(detect_firewall_backend)
+    if [[ "$backend" == "none" ]]; then
+        log "未检测到可管理的防火墙，跳过端口放行"
+        return 0
+    fi
+
+    case "$backend" in
+        ufw)
+            while read -r port protocol; do
+                ensure_ufw_port_open "$port" "$protocol" || return 1
+            done < <(printf '%s' "$normalized_rules" | jq -r '.[] | .port as $port | .protocols[] | "\($port) \(.)"')
+            ;;
+        firewalld)
+            local firewalld_changed=0
+            while read -r port protocol; do
+                ensure_firewalld_port_open "$port" "$protocol" firewalld_changed || return 1
+            done < <(printf '%s' "$normalized_rules" | jq -r '.[] | .port as $port | .protocols[] | "\($port) \(.)"')
+            if [[ "$firewalld_changed" == "1" ]]; then
+                firewall-cmd --reload >/dev/null
+            fi
+            ;;
+        iptables)
+            while read -r port protocol; do
+                ensure_iptables_port_open "$port" "$protocol" || return 1
+            done < <(printf '%s' "$normalized_rules" | jq -r '.[] | .port as $port | .protocols[] | "\($port) \(.)"')
+            ;;
+    esac
+}
+
+detect_service_manager() {
+    if command -v systemctl >/dev/null 2>&1 && timeout 3 systemctl list-units >/dev/null 2>&1; then
+        printf 'systemd'
+        return
+    fi
+
+    if command -v rc-service >/dev/null 2>&1; then
+        printf 'openrc'
+        return
+    fi
+
+    printf 'none'
+}
+
+detect_gost_arch() {
+    case "$(uname -m 2>/dev/null)" in
+        x86_64|amd64)
+            printf 'amd64'
+            ;;
+        aarch64|arm64)
+            printf 'arm64'
+            ;;
+        armv7l|armv7)
+            printf 'armv7'
+            ;;
+        armv6l|armv6)
+            printf 'armv6'
+            ;;
+        i386|i686)
+            printf '386'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_gost_binary() {
+    if [[ -x "$GOST_BIN" ]]; then
+        return 0
+    fi
+
+    local arch
+    local download_url
+    local tmp_file
+
+    arch=$(detect_gost_arch) || {
+        fail "不支持当前架构，无法自动安装 gost"
+        return 1
+    }
+
+    download_url="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-${arch}-${GOST_VERSION}.gz"
+    tmp_file=$(mktemp)
+    if ! curl -fsSL --connect-timeout 8 --max-time 60 "$download_url" -o "$tmp_file"; then
+        rm -f "$tmp_file"
+        fail "下载 gost 失败: ${download_url}"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$GOST_BIN")"
+    if ! gzip -dc "$tmp_file" > "$GOST_BIN"; then
+        rm -f "$tmp_file"
+        rm -f "$GOST_BIN"
+        fail "解压 gost 失败"
+        return 1
+    fi
+    rm -f "$tmp_file"
+    chmod +x "$GOST_BIN"
+    log "已安装 gost ${GOST_VERSION}"
+}
+
+ensure_gost_service() {
+    local service_manager
+    service_manager=$(detect_service_manager)
+
+    case "$service_manager" in
+        systemd)
+            if [[ ! -f /etc/systemd/system/gost.service ]]; then
+                cat > /etc/systemd/system/gost.service <<EOF
+[Unit]
+Description=gost relay service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=${GOST_BIN} -C ${GOST_CONFIG_FILE}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                systemctl daemon-reload >/dev/null 2>&1 || true
+            fi
+            systemctl enable gost >/dev/null 2>&1 || true
+            ;;
+        openrc)
+            if [[ ! -f /etc/init.d/gost ]]; then
+                cat > /etc/init.d/gost <<EOF
+#!/sbin/openrc-run
+
+name="gost"
+description="gost relay service"
+command="${GOST_BIN}"
+command_args="-C ${GOST_CONFIG_FILE}"
+command_background="yes"
+pidfile="/run/gost.pid"
+
+depend() {
+    need net
+}
+EOF
+                chmod +x /etc/init.d/gost
+            fi
+            rc-update add gost default >/dev/null 2>&1 || true
+            ;;
+        *)
+            fail "未检测到 systemd/openrc，无法托管 gost 服务"
+            return 1
+            ;;
+    esac
+}
+
+stop_gost_service() {
+    local service_manager
+    service_manager=$(detect_service_manager)
+
+    case "$service_manager" in
+        systemd)
+            systemctl stop gost >/dev/null 2>&1 || true
+            ;;
+        openrc)
+            rc-service gost stop >/dev/null 2>&1 || true
+            ;;
+        *)
+            pkill -f "${GOST_BIN} -C ${GOST_CONFIG_FILE}" >/dev/null 2>&1 || true
+            ;;
+    esac
+}
+
+restart_gost_service() {
+    local service_manager
+    service_manager=$(detect_service_manager)
+
+    case "$service_manager" in
+        systemd)
+            systemctl restart gost
+            ;;
+        openrc)
+            rc-service gost restart >/dev/null 2>&1 || rc-service gost start >/dev/null 2>&1
+            ;;
+        *)
+            pkill -f "${GOST_BIN} -C ${GOST_CONFIG_FILE}" >/dev/null 2>&1 || true
+            setsid "$GOST_BIN" -C "$GOST_CONFIG_FILE" >/var/log/gost.log 2>&1 < /dev/null &
+            ;;
+    esac
+}
+
+cleanup_gost_config() {
+    GOST_CONFIG_CHANGED=0
+
+    if [[ -f "$GOST_CONFIG_FILE" ]]; then
+        rm -f "$GOST_CONFIG_FILE"
+        GOST_CONFIG_CHANGED=1
+        log "已清理 ${GOST_CONFIG_FILE}"
+    fi
+
+    stop_gost_service
+}
+
+write_gost_config() {
+    local relay_rules_json="$1"
+    local tmp_file
+    local serve_nodes
+
+    GOST_CONFIG_CHANGED=0
+    tmp_file=$(mktemp)
+    if ! serve_nodes=$(printf '%s' "$relay_rules_json" | jq -c '
+        def normhost:
+            tostring as $h
+            | if $h == "" then ""
+              elif ($h | startswith("[")) then $h
+              elif ($h | contains(":")) then "[\($h)]"
+              else $h
+              end;
+        [
+            .[]?
+            | . as $rule
+            | select((.listen_port // 0 | tonumber) >= 1 and (.target_port // 0 | tonumber) >= 1)
+            | (.listen_host // "0.0.0.0" | tostring) as $listenHost
+            | (.target_host // "" | normhost) as $targetHost
+            | select($targetHost != "")
+            | $rule.protocols[]?
+            | ascii_downcase
+            | select(. == "tcp" or . == "udp")
+            | "\(.)://\((if $listenHost == "0.0.0.0" or $listenHost == "::" then ":" else ((($listenHost | normhost)) + ":") end))\(($rule.listen_port | tonumber))/\($targetHost):\(($rule.target_port | tonumber))"
+        ]
+    '); then
+        rm -f "$tmp_file"
+        fail "生成 gost ServeNodes 失败"
+        return 1
+    fi
+
+    if [[ "$(printf '%s' "$serve_nodes" | jq 'length')" -eq 0 ]]; then
+        rm -f "$tmp_file"
+        cleanup_gost_config
+        return 0
+    fi
+
+    if ! jq -n \
+        --argjson serve_nodes "$serve_nodes" \
+        '{
+            Debug: false,
+            Retries: 0,
+            ServeNodes: $serve_nodes
+        }' > "$tmp_file"; then
+        rm -f "$tmp_file"
+        fail "生成 gost 配置文件失败"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$GOST_CONFIG_FILE")"
+    if [[ -f "$GOST_CONFIG_FILE" ]] && cmp -s "$tmp_file" "$GOST_CONFIG_FILE"; then
+        rm -f "$tmp_file"
+        return 0
+    fi
+
+    mv "$tmp_file" "$GOST_CONFIG_FILE"
+    GOST_CONFIG_CHANGED=1
+    log "已更新 ${GOST_CONFIG_FILE}"
+}
+
+get_gost_version() {
+    if [[ ! -x "$GOST_BIN" ]]; then
+        printf ''
+        return
+    fi
+
+    "$GOST_BIN" -V 2>/dev/null | head -n 1 | tr -d '\r'
+}
+
+sync_relay_config() {
+    local relay_json="$1"
+    local relay_rules_json
+
+    relay_rules_json=$(printf '%s' "$relay_json" | jq -c '
+        (.rules // [])
+        | map({
+            listen_host: (.listen_host // "0.0.0.0"),
+            listen_port: ((.listen_port // 0) | tonumber),
+            target_host: (.target_host // ""),
+            target_port: ((.target_port // 0) | tonumber),
+            protocols: (
+                (.protocols // [])
+                | map(ascii_downcase)
+                | map(select(. == "tcp" or . == "udp"))
+                | unique
+            )
+        })
+        | map(select(.listen_port >= 1 and .listen_port <= 65535 and .target_port >= 1 and .target_port <= 65535))
+    ')
+
+    if [[ "$(printf '%s' "$relay_rules_json" | jq 'length')" -eq 0 ]]; then
+        cleanup_gost_config
+        return 0
+    fi
+
+    ensure_gost_binary || return 1
+    ensure_gost_service || return 1
+    write_gost_config "$relay_rules_json" || return 1
+
+    if [[ "${GOST_CONFIG_CHANGED:-0}" == "1" ]]; then
+        restart_gost_service || {
+            fail "重启 gost 服务失败"
+            return 1
+        }
     fi
 }
 
@@ -391,7 +807,7 @@ push_status() {
     load_state || return 1
     ensure_dependencies || return 1
 
-    local cpu mem disk uptime version net_rx net_tx primary_ip body
+    local cpu mem disk uptime version net_rx net_tx primary_ip body gost_version gost_rule_count
     cpu=$(read_cpu_percent)
     mem=$(read_mem_percent)
     disk=$(read_disk_percent)
@@ -399,6 +815,11 @@ push_status() {
     version="v2node-probe $(uname -s 2>/dev/null) $(uname -m 2>/dev/null)"
     primary_ip=$(read_primary_ip)
     read -r net_rx net_tx <<< "$(read_net_bytes)"
+    gost_version=$(get_gost_version)
+    gost_rule_count=0
+    if [[ -f "$GOST_CONFIG_FILE" ]]; then
+        gost_rule_count=$(jq -r '(.ServeNodes // []) | length' "$GOST_CONFIG_FILE" 2>/dev/null || echo 0)
+    fi
 
     body=$(jq -nc \
         --argjson cpu "${cpu:-0}" \
@@ -413,7 +834,9 @@ push_status() {
         --arg ddns_synced_ip "${DDNS_LAST_IP:-}" \
         --argjson ddns_synced_at "${DDNS_LAST_SYNCED_AT:-0}" \
         --arg ddns_error "${DDNS_LAST_ERROR:-}" \
-        '{cpu:$cpu, mem:$mem, disk:$disk, net_rx:$net_rx, net_tx:$net_tx, uptime:$uptime, ip:$ip, version:$version, ddns_host:$ddns_host, ddns_synced_ip:$ddns_synced_ip, ddns_synced_at:$ddns_synced_at, ddns_error:$ddns_error}')
+        --arg gost_version "${gost_version:-}" \
+        --argjson gost_rule_count "${gost_rule_count:-0}" \
+        '{cpu:$cpu, mem:$mem, disk:$disk, net_rx:$net_rx, net_tx:$net_tx, uptime:$uptime, ip:$ip, version:$version, ddns_host:$ddns_host, ddns_synced_ip:$ddns_synced_ip, ddns_synced_at:$ddns_synced_at, ddns_error:$ddns_error, gost_version:$gost_version, gost_rule_count:$gost_rule_count}')
 
     signed_post_json "/api/v1/server/machine/push" "$body" >/dev/null
 }
@@ -421,34 +844,103 @@ push_status() {
 write_config() {
     local nodes_json="$1"
     local tmp_file
+    local existing_config_file
+    local managed_state_file
+    local next_state_file
     CONFIG_CHANGED=0
     tmp_file=$(mktemp)
+    existing_config_file=$(mktemp)
+    managed_state_file=$(mktemp)
+    next_state_file=$(mktemp)
 
-    if ! jq -n \
-        --argjson nodes "$nodes_json" \
-        '{
+    if [[ -f "$CONFIG_FILE" ]] && jq -e 'type == "object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+        cp "$CONFIG_FILE" "$existing_config_file"
+    else
+        jq -n '{
             Log: {
                 Level: "warning",
                 Output: "",
                 Access: "none"
             },
-            Nodes: $nodes
-        }' > "$tmp_file"; then
-        rm -f "$tmp_file"
+            Nodes: []
+        }' > "$existing_config_file"
+    fi
+
+    if [[ -f "$MANAGED_NODES_STATE_FILE" ]] && jq -e 'type == "array"' "$MANAGED_NODES_STATE_FILE" >/dev/null 2>&1; then
+        cp "$MANAGED_NODES_STATE_FILE" "$managed_state_file"
+    else
+        printf '[]\n' > "$managed_state_file"
+    fi
+
+    if ! jq -n \
+        --slurpfile existing "$existing_config_file" \
+        --slurpfile previous_managed "$managed_state_file" \
+        --argjson desired_nodes "$nodes_json" \
+        '
+        def node_key:
+            [
+                (.ApiHost // .api_host // "" | tostring),
+                ((.NodeID // .node_id // 0) | tostring)
+            ] | join("#");
+
+        ($existing[0] // {}) as $old
+        | (($previous_managed[0] // []) | map(tostring)) as $previousKeys
+        | ($desired_nodes // []) as $desired
+        | (($old.Nodes // []) | map(select((node_key as $key | $previousKeys | index($key)) | not))) as $manualNodes
+        | ($desired | map(select(node_key as $key | ($manualNodes | map(node_key) | index($key)) | not))) as $newManagedNodes
+        | $old
+        | .Log = (.Log // {
+            Level: "warning",
+            Output: "",
+            Access: "none"
+        })
+        | .Nodes = ($manualNodes + $newManagedNodes)
+        ' > "$tmp_file"; then
+        rm -f "$tmp_file" "$existing_config_file" "$managed_state_file" "$next_state_file"
         fail "生成配置文件失败"
         return 1
     fi
 
+    if ! printf '%s' "$nodes_json" | jq -c '
+        def node_key:
+            [
+                (.ApiHost // .api_host // "" | tostring),
+                ((.NodeID // .node_id // 0) | tostring)
+            ] | join("#");
+        map(node_key) | unique
+    ' > "$next_state_file"; then
+        rm -f "$tmp_file" "$existing_config_file" "$managed_state_file" "$next_state_file"
+        fail "生成探针节点状态失败"
+        return 1
+    fi
+
+    if ! jq -e '
+        type == "object"
+        and ((.Nodes // []) | type == "array")
+    ' "$tmp_file" >/dev/null; then
+        rm -f "$tmp_file" "$existing_config_file" "$managed_state_file" "$next_state_file"
+        fail "生成配置文件校验失败"
+        return 1
+    fi
+
     mkdir -p "$(dirname "$CONFIG_FILE")"
+    mkdir -p "$(dirname "$MANAGED_NODES_STATE_FILE")"
 
     if [[ -f "$CONFIG_FILE" ]] && cmp -s "$tmp_file" "$CONFIG_FILE"; then
         rm -f "$tmp_file"
-        return 0
+    else
+        mv "$tmp_file" "$CONFIG_FILE"
+        CONFIG_CHANGED=1
+        log "已更新 $CONFIG_FILE"
     fi
 
-    mv "$tmp_file" "$CONFIG_FILE"
-    CONFIG_CHANGED=1
-    log "已更新 $CONFIG_FILE"
+    if [[ ! -f "$MANAGED_NODES_STATE_FILE" ]] || ! cmp -s "$next_state_file" "$MANAGED_NODES_STATE_FILE"; then
+        mv "$next_state_file" "$MANAGED_NODES_STATE_FILE"
+    else
+        rm -f "$next_state_file"
+    fi
+
+    rm -f "$existing_config_file" "$managed_state_file"
 }
 
 restart_v2node_service() {
@@ -500,6 +992,27 @@ sync_once() {
     restart_token=$(printf '%s' "$response" | jq -r '.restart_v2node_token // ""')
     local ddns_json
     ddns_json=$(printf '%s' "$response" | jq -c '.probe.ddns // {}')
+    local firewall_json
+    firewall_json=$(printf '%s' "$response" | jq -c '.probe.firewall_rules // []')
+    local relay_json
+    relay_json=$(printf '%s' "$response" | jq -c '.probe.relay // {}')
+    local combined_firewall_json
+    combined_firewall_json=$(jq -cn \
+        --argjson firewall "$firewall_json" \
+        --argjson relay "$relay_json" '
+        ($firewall // []) + (
+            ($relay.rules // [])
+            | map({
+                port: ((.listen_port // 0) | tonumber),
+                protocol: (.protocol // "relay"),
+                protocols: (
+                    (.protocols // [])
+                    | map(ascii_downcase)
+                    | map(select(. == "tcp" or . == "udp"))
+                    | unique
+                )
+            })
+        )')
 
     local nodes_json
     if ! nodes_json=$(printf '%s' "$response" | jq -c '
@@ -517,6 +1030,8 @@ sync_once() {
     local restart_required=0
 
     sync_ddns "$ddns_json" || true
+    sync_relay_config "$relay_json" || true
+    sync_firewall "$combined_firewall_json" || true
     write_config "$nodes_json"
 
     if [[ "${CONFIG_CHANGED:-0}" == "1" ]]; then

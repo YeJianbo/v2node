@@ -639,7 +639,6 @@ setup_machine_probe() {
     fi
 
     local panel_url="${PANEL_URL_ARG%/}"
-    local backup_file=""
     local escaped_panel_url
     local escaped_machine_token
     escaped_panel_url=$(escape_env_value "$panel_url")
@@ -647,18 +646,9 @@ setup_machine_probe() {
 
     mkdir -p /etc/v2node
     if [[ -f /etc/v2node/config.json ]]; then
-        backup_file="/etc/v2node/config.manual.backup.$(date +%Y%m%d%H%M%S).json"
-        cp /etc/v2node/config.json "$backup_file"
-    fi
-
-    cat > /etc/v2node/probe.env <<EOF
-PANEL_URL='${escaped_panel_url}'
-MACHINE_TOKEN='${escaped_machine_token}'
-MACHINE_ID='${MACHINE_ID_ARG}'
-SYNC_INTERVAL='15'
-EOF
-
-    cat > /etc/v2node/config.json <<EOF
+        echo -e "${yellow}检测到已有 /etc/v2node/config.json，探针安装将保留旧配置；后续只合并面板下发节点${plain}"
+    else
+        cat > /etc/v2node/config.json <<EOF
 {
     "Log": {
         "Level": "warning",
@@ -667,6 +657,14 @@ EOF
     },
     "Nodes": []
 }
+EOF
+    fi
+
+    cat > /etc/v2node/probe.env <<EOF
+PANEL_URL='${escaped_panel_url}'
+MACHINE_TOKEN='${escaped_machine_token}'
+MACHINE_ID='${MACHINE_ID_ARG}'
+SYNC_INTERVAL='15'
 EOF
 
     if [[ x"${release}" == x"alpine" ]]; then
