@@ -9,6 +9,7 @@ on:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
+      - "script/**"
       - ".github/workflows/release.yml"
   pull_request:
     types: [opened, synchronize, reopened]
@@ -16,9 +17,13 @@ on:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
+      - "script/**"
       - ".github/workflows/release.yml"
   release:
     types: [published]
+
+permissions:
+  contents: write
 
 jobs:
 
