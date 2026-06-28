@@ -25,12 +25,21 @@ type NetworkSettingsProxyProtocol struct {
 }
 
 func (v *V2Core) removeInbound(tag string) error {
+	if v == nil || v.ihm == nil {
+		return fmt.Errorf("inbound manager is not ready for tag %s", tag)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return v.ihm.RemoveHandler(ctx, tag)
 }
 
 func (v *V2Core) addInbound(config *core.InboundHandlerConfig) error {
+	if v == nil || v.Server == nil {
+		return errors.New("core server is not ready")
+	}
+	if v.ihm == nil {
+		return errors.New("inbound manager is not ready")
+	}
 	rawHandler, err := core.CreateObject(v.Server, config)
 	if err != nil {
 		return err
