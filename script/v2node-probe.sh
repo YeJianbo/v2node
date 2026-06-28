@@ -1008,28 +1008,118 @@ read_listen_ports() {
     printf ''
 }
 
-read_primary_ip() {
+is_global_ipv4() {
+    local ip="$1"
+
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    awk -v ip="$ip" '
+        BEGIN {
+            split(ip, p, ".")
+            for (i = 1; i <= 4; i++) {
+                if (p[i] !~ /^[0-9]+$/ || p[i] < 0 || p[i] > 255) exit 1
+            }
+            if (p[1] == 0 || p[1] == 10 || p[1] == 127) exit 1
+            if (p[1] == 169 && p[2] == 254) exit 1
+            if (p[1] == 172 && p[2] >= 16 && p[2] <= 31) exit 1
+            if (p[1] == 192 && p[2] == 168) exit 1
+            if (p[1] == 100 && p[2] >= 64 && p[2] <= 127) exit 1
+            if (p[1] == 198 && (p[2] == 18 || p[2] == 19)) exit 1
+            if (p[1] >= 224) exit 1
+            exit 0
+        }
+    '
+}
+
+is_global_ipv6() {
+    local ip="$1"
+    local lower
+
+    [[ "$ip" == *:* ]] || return 1
+    lower=$(printf '%s' "$ip" | tr 'A-Z' 'a-z')
+    [[ "$lower" == "::1" ]] && return 1
+    [[ "$lower" == fe80:* ]] && return 1
+    [[ "$lower" == fc* || "$lower" == fd* ]] && return 1
+    [[ "$lower" == ff* ]] && return 1
+    return 0
+}
+
+read_local_ipv4() {
     local ip
     ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '
-        /^127\./ { next }
-        /^169\.254\./ { next }
-        /^172\.(1[6-9]|2[0-9]|3[0-1])\./ { next }
-        /^198\.18\./ { next }
-        /^198\.19\./ { next }
         /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }
     ')
-    if [[ -n "$ip" ]]; then
+    if is_global_ipv4 "$ip"; then
         printf '%s' "$ip"
         return
     fi
 
     ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
-    if [[ -n "$ip" ]]; then
+    if is_global_ipv4 "$ip"; then
         printf '%s' "$ip"
         return
     fi
 
-    hostname -I 2>/dev/null | awk '{print $1}'
+    printf ''
+}
+
+read_local_ipv6() {
+    local ip
+    ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/:/ { print; exit }')
+    if is_global_ipv6 "$ip"; then
+        printf '%s' "$ip"
+        return
+    fi
+
+    ip=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
+    if is_global_ipv6 "$ip"; then
+        printf '%s' "$ip"
+        return
+    fi
+
+    printf ''
+}
+
+read_public_ip() {
+    local family="$1"
+    local ip
+
+    if ! command -v curl >/dev/null 2>&1; then
+        printf ''
+        return
+    fi
+
+    if [[ "$family" == "4" ]]; then
+        ip=$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' | cut -c 1-64 || true)
+        if is_global_ipv4 "$ip"; then
+            printf '%s' "$ip"
+            return
+        fi
+    elif [[ "$family" == "6" ]]; then
+        ip=$(curl -6fsS --max-time 3 https://api6.ipify.org 2>/dev/null | tr -d '[:space:]' | cut -c 1-128 || true)
+        if is_global_ipv6 "$ip"; then
+            printf '%s' "$ip"
+            return
+        fi
+    fi
+
+    printf ''
+}
+
+read_primary_ip() {
+    local public_ipv4="$1"
+    local public_ipv6="$2"
+    local local_ipv4="$3"
+    local local_ipv6="$4"
+
+    if [[ -n "$public_ipv4" ]]; then
+        printf '%s' "$public_ipv4"
+    elif [[ -n "$public_ipv6" ]]; then
+        printf '%s' "$public_ipv6"
+    elif [[ -n "$local_ipv4" ]]; then
+        printf '%s' "$local_ipv4"
+    else
+        printf '%s' "$local_ipv6"
+    fi
 }
 
 push_status() {
@@ -1037,6 +1127,7 @@ push_status() {
     ensure_dependencies || return 1
 
     local cpu mem disk uptime version net_rx net_tx primary_ip body gost_version gost_rule_count
+    local local_ipv4 local_ipv6 public_ipv4 public_ipv6
     local mem_total mem_used swap_total swap_used swap_percent disk_total disk_used cpu_cores cpu_model os_name kernel arch
     local load_json docker_json connection_json v2node_status gost_status listen_ports process_count virtualization tcp_cc docker_summary
     cpu=$(read_cpu_percent)
@@ -1075,7 +1166,11 @@ push_status() {
     listen_ports=$(read_listen_ports)
     uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d'.' -f1)
     version="v2node-probe $(uname -s 2>/dev/null) $(uname -m 2>/dev/null)"
-    primary_ip=$(read_primary_ip)
+    local_ipv4=$(read_local_ipv4)
+    local_ipv6=$(read_local_ipv6)
+    public_ipv4=$(read_public_ip 4)
+    public_ipv6=$(read_public_ip 6)
+    primary_ip=$(read_primary_ip "$public_ipv4" "$public_ipv6" "$local_ipv4" "$local_ipv6")
     read -r net_rx net_tx <<< "$(read_net_bytes)"
     gost_version=$(get_gost_version)
     gost_rule_count=0
@@ -1110,6 +1205,12 @@ push_status() {
         --argjson net_tx "${net_tx:-0}" \
         --argjson uptime "${uptime:-0}" \
         --arg ip "$primary_ip" \
+        --arg ipv4 "${local_ipv4:-}" \
+        --arg ipv6 "${local_ipv6:-}" \
+        --arg public_ipv4 "${public_ipv4:-}" \
+        --arg public_ipv6 "${public_ipv6:-}" \
+        --arg primary_ipv4 "${public_ipv4:-$local_ipv4}" \
+        --arg primary_ipv6 "${public_ipv6:-$local_ipv6}" \
         --arg version "$version" \
         --arg ddns_host "${DDNS_LAST_HOST:-}" \
         --arg ddns_synced_ip "${DDNS_LAST_IP:-}" \
@@ -1154,6 +1255,12 @@ push_status() {
             net_tx:$net_tx,
             uptime:$uptime,
             ip:$ip,
+            ipv4:$ipv4,
+            ipv6:$ipv6,
+            public_ipv4:$public_ipv4,
+            public_ipv6:$public_ipv6,
+            primary_ipv4:$primary_ipv4,
+            primary_ipv6:$primary_ipv6,
             version:$version,
             ddns_host:$ddns_host,
             ddns_synced_ip:$ddns_synced_ip,
