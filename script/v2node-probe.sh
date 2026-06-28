@@ -763,8 +763,34 @@ read_mem_percent() {
     ' /proc/meminfo 2>/dev/null
 }
 
+read_mem_total_bytes() {
+    awk '/^MemTotal:/ { printf "%d", $2 * 1024 }' /proc/meminfo 2>/dev/null
+}
+
+read_mem_used_bytes() {
+    awk '
+        /^MemTotal:/ { total=$2 }
+        /^MemAvailable:/ { available=$2 }
+        END {
+            if (total > 0 && available >= 0) {
+                printf "%d", (total - available) * 1024
+            } else {
+                printf "0"
+            }
+        }
+    ' /proc/meminfo 2>/dev/null
+}
+
 read_disk_percent() {
     df -P / 2>/dev/null | awk 'NR==2 { gsub(/%/, "", $5); print int($5) }'
+}
+
+read_disk_total_bytes() {
+    df -P / 2>/dev/null | awk 'NR==2 { printf "%d", $2 * 1024 }'
+}
+
+read_disk_used_bytes() {
+    df -P / 2>/dev/null | awk 'NR==2 { printf "%d", $3 * 1024 }'
 }
 
 read_net_bytes() {
@@ -777,6 +803,109 @@ read_net_bytes() {
             printf "%d %d", rx, tx
         }
     ' /proc/net/dev 2>/dev/null
+}
+
+read_cpu_cores() {
+    if command -v nproc >/dev/null 2>&1; then
+        nproc 2>/dev/null
+        return
+    fi
+
+    awk '/^processor[[:space:]]*:/ { count++ } END { print count > 0 ? count : 0 }' /proc/cpuinfo 2>/dev/null
+}
+
+read_cpu_model() {
+    awk -F': ' '
+        /^model name[[:space:]]*:/ { print $2; exit }
+        /^Hardware[[:space:]]*:/ { print $2; exit }
+        /^Processor[[:space:]]*:/ { print $2; exit }
+    ' /proc/cpuinfo 2>/dev/null | cut -c 1-120
+}
+
+read_os_name() {
+    if [[ -r /etc/os-release ]]; then
+        awk -F= '
+            /^PRETTY_NAME=/ {
+                gsub(/^"/, "", $2)
+                gsub(/"$/, "", $2)
+                print $2
+                exit
+            }
+        ' /etc/os-release 2>/dev/null | cut -c 1-120
+        return
+    fi
+
+    uname -s 2>/dev/null
+}
+
+read_load_json() {
+    awk '{ printf "{\"load1\":%s,\"load5\":%s,\"load15\":%s}", $1, $2, $3 }' /proc/loadavg 2>/dev/null
+}
+
+read_service_status() {
+    local name="$1"
+
+    if command -v systemctl >/dev/null 2>&1 && timeout 3 systemctl list-units >/dev/null 2>&1; then
+        local status
+        status=$(systemctl is-active "$name" 2>/dev/null || true)
+        printf '%s' "${status:-unknown}"
+        return
+    fi
+
+    if command -v service >/dev/null 2>&1; then
+        if service "$name" status >/dev/null 2>&1; then
+            printf 'active'
+        else
+            printf 'inactive'
+        fi
+        return
+    fi
+
+    if pgrep -x "$name" >/dev/null 2>&1; then
+        printf 'active'
+        return
+    fi
+
+    printf 'unknown'
+}
+
+read_docker_status_json() {
+    if ! command -v docker >/dev/null 2>&1; then
+        printf '{"docker_total":0,"docker_running":0}'
+        return
+    fi
+
+    local total running
+    total=$(docker ps -a -q 2>/dev/null | wc -l | awk '{print int($1)}')
+    running=$(docker ps -q 2>/dev/null | wc -l | awk '{print int($1)}')
+    printf '{"docker_total":%d,"docker_running":%d}' "${total:-0}" "${running:-0}"
+}
+
+read_listen_ports() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -lntu 2>/dev/null | awk '
+            {
+                proto=$1
+                addr=$5
+                gsub(/^\[/, "", addr)
+                gsub(/\]$/, "", addr)
+                n=split(addr, parts, ":")
+                port=parts[n]
+                if (port ~ /^[0-9]+$/) {
+                    key=tolower(proto) ":" port
+                    if (!seen[key]++) values[++count]=key
+                }
+            }
+            END {
+                for (i=1; i<=count && i<=40; i++) {
+                    printf "%s%s", i == 1 ? "" : ",", values[i]
+                }
+            }
+        '
+        return
+    fi
+
+    printf ''
 }
 
 read_primary_ip() {
@@ -808,9 +937,31 @@ push_status() {
     ensure_dependencies || return 1
 
     local cpu mem disk uptime version net_rx net_tx primary_ip body gost_version gost_rule_count
+    local mem_total mem_used disk_total disk_used cpu_cores cpu_model os_name kernel arch
+    local load_json docker_json v2node_status gost_status listen_ports
     cpu=$(read_cpu_percent)
     mem=$(read_mem_percent)
     disk=$(read_disk_percent)
+    mem_total=$(read_mem_total_bytes)
+    mem_used=$(read_mem_used_bytes)
+    disk_total=$(read_disk_total_bytes)
+    disk_used=$(read_disk_used_bytes)
+    cpu_cores=$(read_cpu_cores)
+    cpu_model=$(read_cpu_model)
+    os_name=$(read_os_name)
+    kernel=$(uname -r 2>/dev/null | cut -c 1-80)
+    arch=$(uname -m 2>/dev/null | cut -c 1-40)
+    load_json=$(read_load_json)
+    if [[ -z "$load_json" ]]; then
+        load_json='{"load1":0,"load5":0,"load15":0}'
+    fi
+    docker_json=$(read_docker_status_json)
+    if [[ -z "$docker_json" ]]; then
+        docker_json='{"docker_total":0,"docker_running":0}'
+    fi
+    v2node_status=$(read_service_status v2node)
+    gost_status=$(read_service_status gost)
+    listen_ports=$(read_listen_ports)
     uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d'.' -f1)
     version="v2node-probe $(uname -s 2>/dev/null) $(uname -m 2>/dev/null)"
     primary_ip=$(read_primary_ip)
@@ -825,6 +976,17 @@ push_status() {
         --argjson cpu "${cpu:-0}" \
         --argjson mem "${mem:-0}" \
         --argjson disk "${disk:-0}" \
+        --argjson mem_total "${mem_total:-0}" \
+        --argjson mem_used "${mem_used:-0}" \
+        --argjson disk_total "${disk_total:-0}" \
+        --argjson disk_used "${disk_used:-0}" \
+        --argjson cpu_cores "${cpu_cores:-0}" \
+        --arg cpu_model "${cpu_model:-}" \
+        --arg os "${os_name:-}" \
+        --arg kernel "${kernel:-}" \
+        --arg arch "${arch:-}" \
+        --argjson load "$load_json" \
+        --argjson docker "$docker_json" \
         --argjson net_rx "${net_rx:-0}" \
         --argjson net_tx "${net_tx:-0}" \
         --argjson uptime "${uptime:-0}" \
@@ -836,7 +998,42 @@ push_status() {
         --arg ddns_error "${DDNS_LAST_ERROR:-}" \
         --arg gost_version "${gost_version:-}" \
         --argjson gost_rule_count "${gost_rule_count:-0}" \
-        '{cpu:$cpu, mem:$mem, disk:$disk, net_rx:$net_rx, net_tx:$net_tx, uptime:$uptime, ip:$ip, version:$version, ddns_host:$ddns_host, ddns_synced_ip:$ddns_synced_ip, ddns_synced_at:$ddns_synced_at, ddns_error:$ddns_error, gost_version:$gost_version, gost_rule_count:$gost_rule_count}')
+        --arg v2node_status "${v2node_status:-unknown}" \
+        --arg gost_status "${gost_status:-unknown}" \
+        --arg listen_ports "${listen_ports:-}" \
+        '{
+            cpu:$cpu,
+            mem:$mem,
+            disk:$disk,
+            mem_total:$mem_total,
+            mem_used:$mem_used,
+            disk_total:$disk_total,
+            disk_used:$disk_used,
+            cpu_cores:$cpu_cores,
+            cpu_model:$cpu_model,
+            os:$os,
+            kernel:$kernel,
+            arch:$arch,
+            load1:($load.load1 // 0),
+            load5:($load.load5 // 0),
+            load15:($load.load15 // 0),
+            docker_total:($docker.docker_total // 0),
+            docker_running:($docker.docker_running // 0),
+            net_rx:$net_rx,
+            net_tx:$net_tx,
+            uptime:$uptime,
+            ip:$ip,
+            version:$version,
+            ddns_host:$ddns_host,
+            ddns_synced_ip:$ddns_synced_ip,
+            ddns_synced_at:$ddns_synced_at,
+            ddns_error:$ddns_error,
+            gost_version:$gost_version,
+            gost_rule_count:$gost_rule_count,
+            v2node_status:$v2node_status,
+            gost_status:$gost_status,
+            listen_ports:$listen_ports
+        }')
 
     signed_post_json "/api/v1/server/machine/push" "$body" >/dev/null
 }
