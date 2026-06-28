@@ -1302,6 +1302,68 @@ ack_restart_v2node() {
     signed_post_json "/api/v1/server/machine/restartAck" "$body" >/dev/null
 }
 
+ack_enable_bbr() {
+    local enable_bbr_token="$1"
+    local status="${2:-success}"
+    local error="${3:-}"
+    local body
+    body=$(jq -nc \
+        --arg enable_bbr_token "$enable_bbr_token" \
+        --arg status "$status" \
+        --arg error "$error" \
+        '{enable_bbr_token:$enable_bbr_token,status:$status,error:$error}')
+    signed_post_json "/api/v1/server/machine/bbrAck" "$body" >/dev/null
+}
+
+enable_bbr_tuning() {
+    local available current conf_file virtualization
+
+    if [[ "$(id -u 2>/dev/null || echo 1)" != "0" ]]; then
+        fail "启用 BBR 需要 root 权限"
+        return 1
+    fi
+
+    virtualization=$(read_virtualization)
+    if [[ "$virtualization" != "kvm" ]]; then
+        fail "BBR 仅对 KVM 虚拟化机器开放，当前为 ${virtualization:-unknown}"
+        return 1
+    fi
+
+    if [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]]; then
+        available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
+        if ! printf '%s' "$available" | grep -qw 'bbr'; then
+            modprobe tcp_bbr >/dev/null 2>&1 || true
+            available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
+        fi
+        if ! printf '%s' "$available" | grep -qw 'bbr'; then
+            fail "当前内核未提供 BBR 拥塞控制"
+            return 1
+        fi
+    fi
+
+    mkdir -p /etc/sysctl.d
+    conf_file="/etc/sysctl.d/99-v2node-bbr.conf"
+    cat > "$conf_file" <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    if ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+        fail "写入 net.ipv4.tcp_congestion_control=bbr 失败"
+        return 1
+    fi
+
+    current=$(read_tcp_congestion_control)
+    if [[ "$current" != "bbr" ]]; then
+        fail "BBR 写入后未生效，当前为 ${current:-unknown}"
+        return 1
+    fi
+
+    log "已启用 BBR 拥塞控制"
+    return 0
+}
+
 sync_once() {
     load_state || return 1
     ensure_dependencies || return 1
@@ -1318,6 +1380,8 @@ sync_once() {
 
     local restart_token
     restart_token=$(printf '%s' "$response" | jq -r '.restart_v2node_token // ""')
+    local enable_bbr_token
+    enable_bbr_token=$(printf '%s' "$response" | jq -r '.enable_bbr_token // ""')
     local ddns_json
     ddns_json=$(printf '%s' "$response" | jq -c '.probe.ddns // {}')
     local firewall_json
@@ -1356,6 +1420,19 @@ sync_once() {
     fi
 
     local restart_required=0
+
+    if [[ -n "$enable_bbr_token" && "$enable_bbr_token" != "null" ]]; then
+        local bbr_error_file
+        bbr_error_file=$(mktemp)
+        if enable_bbr_tuning 2>"$bbr_error_file"; then
+            ack_enable_bbr "$enable_bbr_token" "success" "" || true
+        else
+            local bbr_error
+            bbr_error=$(tail -n 1 "$bbr_error_file" 2>/dev/null | cut -c 1-220)
+            ack_enable_bbr "$enable_bbr_token" "failed" "${bbr_error:-启用 BBR 失败}" || true
+        fi
+        rm -f "$bbr_error_file"
+    fi
 
     sync_ddns "$ddns_json" || true
     sync_relay_config "$relay_json" || true
