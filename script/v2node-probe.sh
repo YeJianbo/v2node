@@ -781,6 +781,38 @@ read_mem_used_bytes() {
     ' /proc/meminfo 2>/dev/null
 }
 
+read_swap_total_bytes() {
+    awk '/^SwapTotal:/ { printf "%d", $2 * 1024 }' /proc/meminfo 2>/dev/null
+}
+
+read_swap_used_bytes() {
+    awk '
+        /^SwapTotal:/ { total=$2 }
+        /^SwapFree:/ { free=$2 }
+        END {
+            if (total > 0 && free >= 0) {
+                printf "%d", (total - free) * 1024
+            } else {
+                printf "0"
+            }
+        }
+    ' /proc/meminfo 2>/dev/null
+}
+
+read_swap_percent() {
+    awk '
+        /^SwapTotal:/ { total=$2 }
+        /^SwapFree:/ { free=$2 }
+        END {
+            if (total > 0 && free >= 0) {
+                printf "%d", ((total - free) * 100 / total)
+            } else {
+                printf "0"
+            }
+        }
+    ' /proc/meminfo 2>/dev/null
+}
+
 read_disk_percent() {
     df -P / 2>/dev/null | awk 'NR==2 { gsub(/%/, "", $5); print int($5) }'
 }
@@ -838,6 +870,61 @@ read_os_name() {
     uname -s 2>/dev/null
 }
 
+read_process_count() {
+    if command -v ps >/dev/null 2>&1; then
+        ps -e --no-headers 2>/dev/null | wc -l | awk '{print int($1)}'
+        return
+    fi
+
+    find /proc -maxdepth 1 -type d -regex '.*/[0-9]+' 2>/dev/null | wc -l | awk '{print int($1)}'
+}
+
+read_virtualization() {
+    if [[ -f /.dockerenv ]]; then
+        printf 'docker'
+        return
+    fi
+
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        systemd-detect-virt 2>/dev/null | head -n 1 | cut -c 1-40
+        return
+    fi
+
+    if grep -qaE 'docker|lxc|kubepods|containerd' /proc/1/cgroup 2>/dev/null; then
+        printf 'container'
+        return
+    fi
+
+    printf 'none'
+}
+
+read_tcp_congestion_control() {
+    if command -v sysctl >/dev/null 2>&1; then
+        sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | head -n 1 | cut -c 1-40
+        return
+    fi
+
+    if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
+        head -n 1 /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null | cut -c 1-40
+        return
+    fi
+
+    printf ''
+}
+
+read_connection_json() {
+    if ! command -v ss >/dev/null 2>&1; then
+        printf '{"tcp_conn":0,"tcp_established":0,"udp_conn":0}'
+        return
+    fi
+
+    local tcp_conn tcp_established udp_conn
+    tcp_conn=$(ss -H -tan 2>/dev/null | wc -l | awk '{print int($1)}')
+    tcp_established=$(ss -H -tan state established 2>/dev/null | wc -l | awk '{print int($1)}')
+    udp_conn=$(ss -H -uan 2>/dev/null | wc -l | awk '{print int($1)}')
+    printf '{"tcp_conn":%d,"tcp_established":%d,"udp_conn":%d}' "${tcp_conn:-0}" "${tcp_established:-0}" "${udp_conn:-0}"
+}
+
 read_load_json() {
     awk '{ printf "{\"load1\":%s,\"load5\":%s,\"load15\":%s}", $1, $2, $3 }' /proc/loadavg 2>/dev/null
 }
@@ -871,14 +958,27 @@ read_service_status() {
 
 read_docker_status_json() {
     if ! command -v docker >/dev/null 2>&1; then
-        printf '{"docker_total":0,"docker_running":0}'
+        printf '{"docker_total":0,"docker_running":0,"docker_images":0}'
         return
     fi
 
-    local total running
+    local total running images
     total=$(docker ps -a -q 2>/dev/null | wc -l | awk '{print int($1)}')
     running=$(docker ps -q 2>/dev/null | wc -l | awk '{print int($1)}')
-    printf '{"docker_total":%d,"docker_running":%d}' "${total:-0}" "${running:-0}"
+    images=$(docker images -q 2>/dev/null | sort -u | wc -l | awk '{print int($1)}')
+    printf '{"docker_total":%d,"docker_running":%d,"docker_images":%d}' "${total:-0}" "${running:-0}" "${images:-0}"
+}
+
+read_docker_summary() {
+    if ! command -v docker >/dev/null 2>&1; then
+        printf ''
+        return
+    fi
+
+    docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null \
+        | head -n 5 \
+        | paste -sd '; ' - \
+        | cut -c 1-180
 }
 
 read_listen_ports() {
@@ -937,13 +1037,16 @@ push_status() {
     ensure_dependencies || return 1
 
     local cpu mem disk uptime version net_rx net_tx primary_ip body gost_version gost_rule_count
-    local mem_total mem_used disk_total disk_used cpu_cores cpu_model os_name kernel arch
-    local load_json docker_json v2node_status gost_status listen_ports
+    local mem_total mem_used swap_total swap_used swap_percent disk_total disk_used cpu_cores cpu_model os_name kernel arch
+    local load_json docker_json connection_json v2node_status gost_status listen_ports process_count virtualization tcp_cc docker_summary
     cpu=$(read_cpu_percent)
     mem=$(read_mem_percent)
     disk=$(read_disk_percent)
     mem_total=$(read_mem_total_bytes)
     mem_used=$(read_mem_used_bytes)
+    swap_total=$(read_swap_total_bytes)
+    swap_used=$(read_swap_used_bytes)
+    swap_percent=$(read_swap_percent)
     disk_total=$(read_disk_total_bytes)
     disk_used=$(read_disk_used_bytes)
     cpu_cores=$(read_cpu_cores)
@@ -951,14 +1054,22 @@ push_status() {
     os_name=$(read_os_name)
     kernel=$(uname -r 2>/dev/null | cut -c 1-80)
     arch=$(uname -m 2>/dev/null | cut -c 1-40)
+    process_count=$(read_process_count)
+    virtualization=$(read_virtualization)
+    tcp_cc=$(read_tcp_congestion_control)
     load_json=$(read_load_json)
     if [[ -z "$load_json" ]]; then
         load_json='{"load1":0,"load5":0,"load15":0}'
     fi
+    connection_json=$(read_connection_json)
+    if [[ -z "$connection_json" ]]; then
+        connection_json='{"tcp_conn":0,"tcp_established":0,"udp_conn":0}'
+    fi
     docker_json=$(read_docker_status_json)
     if [[ -z "$docker_json" ]]; then
-        docker_json='{"docker_total":0,"docker_running":0}'
+        docker_json='{"docker_total":0,"docker_running":0,"docker_images":0}'
     fi
+    docker_summary=$(read_docker_summary)
     v2node_status=$(read_service_status v2node)
     gost_status=$(read_service_status gost)
     listen_ports=$(read_listen_ports)
@@ -978,6 +1089,9 @@ push_status() {
         --argjson disk "${disk:-0}" \
         --argjson mem_total "${mem_total:-0}" \
         --argjson mem_used "${mem_used:-0}" \
+        --argjson swap_total "${swap_total:-0}" \
+        --argjson swap_used "${swap_used:-0}" \
+        --argjson swap_percent "${swap_percent:-0}" \
         --argjson disk_total "${disk_total:-0}" \
         --argjson disk_used "${disk_used:-0}" \
         --argjson cpu_cores "${cpu_cores:-0}" \
@@ -985,8 +1099,13 @@ push_status() {
         --arg os "${os_name:-}" \
         --arg kernel "${kernel:-}" \
         --arg arch "${arch:-}" \
+        --argjson process_count "${process_count:-0}" \
+        --arg virtualization "${virtualization:-}" \
+        --arg tcp_cc "${tcp_cc:-}" \
         --argjson load "$load_json" \
+        --argjson conn "$connection_json" \
         --argjson docker "$docker_json" \
+        --arg docker_summary "${docker_summary:-}" \
         --argjson net_rx "${net_rx:-0}" \
         --argjson net_tx "${net_tx:-0}" \
         --argjson uptime "${uptime:-0}" \
@@ -1007,6 +1126,9 @@ push_status() {
             disk:$disk,
             mem_total:$mem_total,
             mem_used:$mem_used,
+            swap_total:$swap_total,
+            swap_used:$swap_used,
+            swap_percent:$swap_percent,
             disk_total:$disk_total,
             disk_used:$disk_used,
             cpu_cores:$cpu_cores,
@@ -1014,11 +1136,20 @@ push_status() {
             os:$os,
             kernel:$kernel,
             arch:$arch,
+            process_count:$process_count,
+            virtualization:$virtualization,
+            tcp_congestion_control:$tcp_cc,
+            bbr_status:(if $tcp_cc == "bbr" then "enabled" elif $tcp_cc == "" then "unknown" else "disabled" end),
             load1:($load.load1 // 0),
             load5:($load.load5 // 0),
             load15:($load.load15 // 0),
+            tcp_conn:($conn.tcp_conn // 0),
+            tcp_established:($conn.tcp_established // 0),
+            udp_conn:($conn.udp_conn // 0),
             docker_total:($docker.docker_total // 0),
             docker_running:($docker.docker_running // 0),
+            docker_images:($docker.docker_images // 0),
+            docker_summary:$docker_summary,
             net_rx:$net_rx,
             net_tx:$net_tx,
             uptime:$uptime,
