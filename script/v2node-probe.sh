@@ -6,9 +6,12 @@ STATE_FILE="${V2NODE_PROBE_STATE_FILE:-/etc/v2node/probe.env}"
 CONFIG_FILE="${V2NODE_CONFIG_FILE:-/etc/v2node/config.json}"
 MANAGED_NODES_STATE_FILE="${V2NODE_PROBE_MANAGED_NODES_STATE_FILE:-/etc/v2node/probe-managed-nodes.json}"
 DDNS_STATE_FILE="${V2NODE_PROBE_DDNS_STATE_FILE:-/etc/v2node/probe-ddns.state}"
+UPDATE_STATE_FILE="${V2NODE_PROBE_UPDATE_STATE_FILE:-/etc/v2node/probe-update.state}"
 GOST_CONFIG_FILE="${V2NODE_PROBE_GOST_CONFIG_FILE:-/etc/gost/config.json}"
 GOST_BIN="${V2NODE_PROBE_GOST_BIN:-/usr/bin/gost}"
 GOST_VERSION="${V2NODE_PROBE_GOST_VERSION:-2.11.2}"
+AUTO_UPDATE_INTERVAL_DEFAULT=86400
+AUTO_UPDATE_REPO_DEFAULT="YeJianbo/v2node"
 SYNC_INTERVAL_DEFAULT=15
 CONFIG_CHANGED=0
 GOST_CONFIG_CHANGED=0
@@ -43,6 +46,7 @@ load_state() {
 
     PANEL_URL="${PANEL_URL%/}"
     load_ddns_state
+    load_update_state
 }
 
 ensure_dependencies() {
@@ -503,6 +507,125 @@ update_ddns_state() {
     DDNS_LAST_SYNCED_AT="${3:-$DDNS_LAST_SYNCED_AT}"
     DDNS_LAST_ERROR="${4:-$DDNS_LAST_ERROR}"
     save_ddns_state
+}
+
+load_update_state() {
+    PROBE_AUTO_UPDATE_ENABLED="${PROBE_AUTO_UPDATE_ENABLED:-false}"
+    PROBE_AUTO_UPDATE_INTERVAL="${PROBE_AUTO_UPDATE_INTERVAL:-$AUTO_UPDATE_INTERVAL_DEFAULT}"
+    PROBE_AUTO_UPDATE_REPO="${PROBE_AUTO_UPDATE_REPO:-$AUTO_UPDATE_REPO_DEFAULT}"
+    PROBE_UPDATE_LAST_CHECKED_AT="${PROBE_UPDATE_LAST_CHECKED_AT:-0}"
+    PROBE_UPDATE_LAST_VERSION="${PROBE_UPDATE_LAST_VERSION:-}"
+    PROBE_UPDATE_LAST_ERROR="${PROBE_UPDATE_LAST_ERROR:-}"
+
+    if [[ -f "$UPDATE_STATE_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$UPDATE_STATE_FILE"
+    fi
+}
+
+save_update_state() {
+    mkdir -p "$(dirname "$UPDATE_STATE_FILE")"
+    cat > "$UPDATE_STATE_FILE" <<EOF
+PROBE_AUTO_UPDATE_ENABLED='${PROBE_AUTO_UPDATE_ENABLED//\'/\'\"\'\"\'}'
+PROBE_AUTO_UPDATE_INTERVAL='${PROBE_AUTO_UPDATE_INTERVAL//\'/\'\"\'\"\'}'
+PROBE_AUTO_UPDATE_REPO='${PROBE_AUTO_UPDATE_REPO//\'/\'\"\'\"\'}'
+PROBE_UPDATE_LAST_CHECKED_AT='${PROBE_UPDATE_LAST_CHECKED_AT//\'/\'\"\'\"\'}'
+PROBE_UPDATE_LAST_VERSION='${PROBE_UPDATE_LAST_VERSION//\'/\'\"\'\"\'}'
+PROBE_UPDATE_LAST_ERROR='${PROBE_UPDATE_LAST_ERROR//\'/\'\"\'\"\'}'
+EOF
+}
+
+get_local_v2node_version() {
+    if [[ -x /usr/local/v2node/v2node ]]; then
+        /usr/local/v2node/v2node version 2>/dev/null | awk 'NR==1 {print $2}' | cut -c 1-64
+        return 0
+    fi
+
+    printf ''
+}
+
+get_latest_release_version() {
+    local repo="${1:-$AUTO_UPDATE_REPO_DEFAULT}"
+    curl -fsSL \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'User-Agent: v2node-probe' \
+        "https://api.github.com/repos/${repo}/releases/latest" \
+        | jq -r '(.tag_name // .name // "") | ltrimstr("v")' \
+        | tr -d '\r' \
+        | cut -c 1-64
+}
+
+version_is_newer() {
+    local current_version="$1"
+    local latest_version="$2"
+
+    if [[ -z "$current_version" || -z "$latest_version" || "$current_version" == "$latest_version" ]]; then
+        return 1
+    fi
+
+    [[ "$(printf '%s\n%s\n' "$current_version" "$latest_version" | sort -V | tail -n 1)" == "$latest_version" ]]
+}
+
+maybe_auto_update() {
+    local auto_update_json="$1"
+    local enabled interval repo now current_version latest_version update_log_file update_error
+
+    enabled=$(printf '%s' "$auto_update_json" | jq -r '.enabled // false')
+    interval=$(printf '%s' "$auto_update_json" | jq -r '.interval_seconds // 86400')
+    repo=$(printf '%s' "$auto_update_json" | jq -r '.repo // "YeJianbo/v2node"')
+    now=$(date +%s)
+
+    PROBE_AUTO_UPDATE_ENABLED="$enabled"
+    PROBE_AUTO_UPDATE_INTERVAL="$interval"
+    PROBE_AUTO_UPDATE_REPO="$repo"
+
+    if [[ "$enabled" != "true" ]]; then
+        save_update_state
+        return 1
+    fi
+
+    if ! [[ "$interval" =~ ^[0-9]+$ ]] || (( interval < 300 )); then
+        interval=$AUTO_UPDATE_INTERVAL_DEFAULT
+        PROBE_AUTO_UPDATE_INTERVAL="$interval"
+    fi
+
+    if (( now - ${PROBE_UPDATE_LAST_CHECKED_AT:-0} < interval )); then
+        save_update_state
+        return 1
+    fi
+
+    current_version=$(get_local_v2node_version)
+    PROBE_UPDATE_LAST_CHECKED_AT="$now"
+    PROBE_UPDATE_LAST_ERROR=""
+
+    if ! latest_version=$(get_latest_release_version "$repo"); then
+        PROBE_UPDATE_LAST_ERROR="检查最新版本失败"
+        save_update_state
+        return 1
+    fi
+
+    PROBE_UPDATE_LAST_VERSION="$latest_version"
+    save_update_state
+
+    if ! version_is_newer "$current_version" "$latest_version"; then
+        return 1
+    fi
+
+    log "检测到 v2node 新版本 ${latest_version}，当前 ${current_version:-unknown}，开始自动更新"
+    update_log_file=$(mktemp)
+
+    if /usr/bin/v2node update >"$update_log_file" 2>&1; then
+        log "v2node 自动更新命令已执行"
+        rm -f "$update_log_file"
+        return 0
+    fi
+
+    update_error=$(tail -n 1 "$update_log_file" 2>/dev/null | cut -c 1-220)
+    rm -f "$update_log_file"
+    PROBE_UPDATE_LAST_ERROR="${update_error:-自动更新失败}"
+    save_update_state
+    fail "${PROBE_UPDATE_LAST_ERROR}"
+    return 1
 }
 
 sha256_hex() {
@@ -1127,6 +1250,7 @@ push_status() {
     ensure_dependencies || return 1
 
     local cpu mem disk uptime version net_rx net_tx primary_ip body gost_version gost_rule_count
+    local v2node_version probe_update_checked_at probe_update_latest_version probe_update_error
     local local_ipv4 local_ipv6 public_ipv4 public_ipv6
     local mem_total mem_used swap_total swap_used swap_percent disk_total disk_used cpu_cores cpu_model os_name kernel arch
     local load_json docker_json connection_json v2node_status gost_status listen_ports process_count virtualization tcp_cc docker_summary
@@ -1166,6 +1290,7 @@ push_status() {
     listen_ports=$(read_listen_ports)
     uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d'.' -f1)
     version="v2node-probe $(uname -s 2>/dev/null) $(uname -m 2>/dev/null)"
+    v2node_version=$(get_local_v2node_version)
     local_ipv4=$(read_local_ipv4)
     local_ipv6=$(read_local_ipv6)
     public_ipv4=$(read_public_ip 4)
@@ -1173,6 +1298,9 @@ push_status() {
     primary_ip=$(read_primary_ip "$public_ipv4" "$public_ipv6" "$local_ipv4" "$local_ipv6")
     read -r net_rx net_tx <<< "$(read_net_bytes)"
     gost_version=$(get_gost_version)
+    probe_update_checked_at="${PROBE_UPDATE_LAST_CHECKED_AT:-0}"
+    probe_update_latest_version="${PROBE_UPDATE_LAST_VERSION:-}"
+    probe_update_error="${PROBE_UPDATE_LAST_ERROR:-}"
     gost_rule_count=0
     if [[ -f "$GOST_CONFIG_FILE" ]]; then
         gost_rule_count=$(jq -r '(.ServeNodes // []) | length' "$GOST_CONFIG_FILE" 2>/dev/null || echo 0)
@@ -1212,12 +1340,17 @@ push_status() {
         --arg primary_ipv4 "${public_ipv4:-$local_ipv4}" \
         --arg primary_ipv6 "${public_ipv6:-$local_ipv6}" \
         --arg version "$version" \
+        --arg v2node_version "${v2node_version:-}" \
         --arg ddns_host "${DDNS_LAST_HOST:-}" \
         --arg ddns_synced_ip "${DDNS_LAST_IP:-}" \
         --argjson ddns_synced_at "${DDNS_LAST_SYNCED_AT:-0}" \
         --arg ddns_error "${DDNS_LAST_ERROR:-}" \
         --arg gost_version "${gost_version:-}" \
         --argjson gost_rule_count "${gost_rule_count:-0}" \
+        --arg probe_auto_update "${PROBE_AUTO_UPDATE_ENABLED:-false}" \
+        --argjson probe_update_checked_at "${probe_update_checked_at:-0}" \
+        --arg probe_update_latest_version "${probe_update_latest_version:-}" \
+        --arg probe_update_error "${probe_update_error:-}" \
         --arg v2node_status "${v2node_status:-unknown}" \
         --arg gost_status "${gost_status:-unknown}" \
         --arg listen_ports "${listen_ports:-}" \
@@ -1262,12 +1395,17 @@ push_status() {
             primary_ipv4:$primary_ipv4,
             primary_ipv6:$primary_ipv6,
             version:$version,
+            v2node_version:$v2node_version,
             ddns_host:$ddns_host,
             ddns_synced_ip:$ddns_synced_ip,
             ddns_synced_at:$ddns_synced_at,
             ddns_error:$ddns_error,
             gost_version:$gost_version,
             gost_rule_count:$gost_rule_count,
+            probe_auto_update:($probe_auto_update == "true"),
+            probe_update_checked_at:$probe_update_checked_at,
+            probe_update_latest_version:$probe_update_latest_version,
+            probe_update_error:$probe_update_error,
             v2node_status:$v2node_status,
             gost_status:$gost_status,
             listen_ports:$listen_ports
@@ -1491,6 +1629,8 @@ sync_once() {
     enable_bbr_token=$(printf '%s' "$response" | jq -r '.enable_bbr_token // ""')
     local ddns_json
     ddns_json=$(printf '%s' "$response" | jq -c '.probe.ddns // {}')
+    local auto_update_json
+    auto_update_json=$(printf '%s' "$response" | jq -c '.probe.auto_update // {}')
     local firewall_json
     firewall_json=$(printf '%s' "$response" | jq -c '.probe.firewall_rules // []')
     local relay_json
@@ -1564,6 +1704,8 @@ sync_once() {
             return 1
         fi
     fi
+
+    maybe_auto_update "$auto_update_json" || true
 
     push_status || true
 }
