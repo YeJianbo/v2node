@@ -490,7 +490,14 @@ sync_relay_config() {
             listen_port: ((.listen_port // .listenPort // .local_port // .localPort // 0) | tonumber),
             target_host: (.target_host // .targetHost // .remote_host // .remoteHost // .host // ""),
             target_port: ((.target_port // .targetPort // .remote_port // .remotePort // .port // 0) | tonumber),
-            protocols: ((.protocols // .protocol // .type // []) | normprotos)
+            protocols: (
+                (if ((.protocols // null) | type) == "array" and ((.protocols // []) | length) > 0 then .protocols
+                 elif ((.protocols // null) | type) == "string" and ((.protocols // "") | length) > 0 then .protocols
+                 elif (.protocol // null) then .protocol
+                 elif (.type // null) then .type
+                 else []
+                 end) | normprotos
+            )
         })
         | map(select(.listen_port >= 1 and .listen_port <= 65535 and .target_port >= 1 and .target_port <= 65535))
     '); then
