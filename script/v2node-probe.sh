@@ -8,6 +8,7 @@ MANAGED_NODES_STATE_FILE="${V2NODE_PROBE_MANAGED_NODES_STATE_FILE:-/etc/v2node/p
 DDNS_STATE_FILE="${V2NODE_PROBE_DDNS_STATE_FILE:-/etc/v2node/probe-ddns.state}"
 UPDATE_STATE_FILE="${V2NODE_PROBE_UPDATE_STATE_FILE:-/etc/v2node/probe-update.state}"
 GOST_CONFIG_FILE="${V2NODE_PROBE_GOST_CONFIG_FILE:-/etc/gost/config.json}"
+GOST_CONFIG_BACKUP_FILE="${V2NODE_PROBE_GOST_CONFIG_BACKUP_FILE:-/etc/gost/config.json.last-good}"
 GOST_BIN="${V2NODE_PROBE_GOST_BIN:-/usr/bin/gost}"
 GOST_VERSION="${V2NODE_PROBE_GOST_VERSION:-2.11.2}"
 SINGBOX_BIN="${V2NODE_PROBE_SINGBOX_BIN:-/usr/local/bin/sing-box-v2node-test}"
@@ -380,6 +381,17 @@ cleanup_gost_config() {
     stop_gost_service
 }
 
+restore_last_good_gost_config() {
+    if [[ ! -f "$GOST_CONFIG_BACKUP_FILE" ]]; then
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$GOST_CONFIG_FILE")"
+    cp "$GOST_CONFIG_BACKUP_FILE" "$GOST_CONFIG_FILE"
+    GOST_CONFIG_CHANGED=1
+    log "已恢复上一份可用 gost 配置"
+}
+
 write_gost_config() {
     local relay_rules_json="$1"
     local tmp_file
@@ -415,7 +427,10 @@ write_gost_config() {
 
     if [[ "$(printf '%s' "$serve_nodes" | jq 'length')" -eq 0 ]]; then
         rm -f "$tmp_file"
-        cleanup_gost_config
+        if [[ ! -f "$GOST_CONFIG_FILE" ]]; then
+            restore_last_good_gost_config || true
+        fi
+        log "本次转发规则为空，保留当前 gost 配置"
         return 0
     fi
 
@@ -438,6 +453,7 @@ write_gost_config() {
     fi
 
     mv "$tmp_file" "$GOST_CONFIG_FILE"
+    cp "$GOST_CONFIG_FILE" "$GOST_CONFIG_BACKUP_FILE" 2>/dev/null || true
     GOST_CONFIG_CHANGED=1
     log "已更新 ${GOST_CONFIG_FILE}"
 }
@@ -458,18 +474,23 @@ sync_relay_config() {
     local had_previous_gost_config=0
 
     if ! relay_rules_json=$(printf '%s' "$relay_json" | jq -c '
+        def normprotos:
+            if type == "array" then .
+            elif type == "string" then (gsub("[,;/|+]+"; " ") | split(" "))
+            else []
+            end
+            | map(ascii_downcase)
+            | map(if . == "all" or . == "both" or . == "tcpudp" then ["tcp", "udp"] else [.] end)
+            | flatten
+            | map(select(. == "tcp" or . == "udp"))
+            | unique;
         (.rules // [])
         | map({
-            listen_host: (.listen_host // "0.0.0.0"),
-            listen_port: ((.listen_port // 0) | tonumber),
-            target_host: (.target_host // ""),
-            target_port: ((.target_port // 0) | tonumber),
-            protocols: (
-                (.protocols // [])
-                | map(ascii_downcase)
-                | map(select(. == "tcp" or . == "udp"))
-                | unique
-            )
+            listen_host: (.listen_host // .listenHost // .local_host // .localHost // "0.0.0.0"),
+            listen_port: ((.listen_port // .listenPort // .local_port // .localPort // 0) | tonumber),
+            target_host: (.target_host // .targetHost // .remote_host // .remoteHost // .host // ""),
+            target_port: ((.target_port // .targetPort // .remote_port // .remotePort // .port // 0) | tonumber),
+            protocols: ((.protocols // .protocol // .type // []) | normprotos)
         })
         | map(select(.listen_port >= 1 and .listen_port <= 65535 and .target_port >= 1 and .target_port <= 65535))
     '); then
@@ -484,7 +505,13 @@ sync_relay_config() {
     fi
 
     if [[ "$(printf '%s' "$relay_rules_json" | jq 'length')" -eq 0 ]]; then
-        cleanup_gost_config
+        if [[ ! -f "$GOST_CONFIG_FILE" ]]; then
+            restore_last_good_gost_config || true
+            if [[ "${GOST_CONFIG_CHANGED:-0}" == "1" ]]; then
+                restart_gost_service || true
+            fi
+        fi
+        log "本次下发转发规则为空，保留当前 gost 配置"
         rm -f "$previous_gost_config"
         return 0
     fi
@@ -686,6 +713,7 @@ version_is_newer() {
 maybe_auto_update() {
     local auto_update_json="$1"
     local enabled interval repo now current_version latest_version update_log_file update_error
+    local probe_script_updated=0
 
     enabled=$(printf '%s' "$auto_update_json" | jq -r '.enabled // false')
     interval=$(printf '%s' "$auto_update_json" | jq -r '.interval_seconds // 86400')
@@ -715,9 +743,16 @@ maybe_auto_update() {
     PROBE_UPDATE_LAST_CHECKED_AT="$now"
     PROBE_UPDATE_LAST_ERROR=""
 
+    if update_probe_script "$repo"; then
+        probe_script_updated=1
+    fi
+
     if ! latest_version=$(get_latest_release_version "$repo"); then
         PROBE_UPDATE_LAST_ERROR="检查最新版本失败"
         save_update_state
+        if [[ "$probe_script_updated" == "1" ]]; then
+            restart_probe_service || true
+        fi
         return 1
     fi
 
@@ -725,6 +760,9 @@ maybe_auto_update() {
     save_update_state
 
     if ! version_is_newer "$current_version" "$latest_version"; then
+        if [[ "$probe_script_updated" == "1" ]]; then
+            restart_probe_service || true
+        fi
         return 1
     fi
 
@@ -734,6 +772,9 @@ maybe_auto_update() {
     if /usr/bin/v2node update >"$update_log_file" 2>&1; then
         log "v2node 自动更新命令已执行"
         rm -f "$update_log_file"
+        if [[ "$probe_script_updated" == "1" ]]; then
+            restart_probe_service || true
+        fi
         return 0
     fi
 
@@ -742,7 +783,56 @@ maybe_auto_update() {
     PROBE_UPDATE_LAST_ERROR="${update_error:-自动更新失败}"
     save_update_state
     fail "${PROBE_UPDATE_LAST_ERROR}"
+    if [[ "$probe_script_updated" == "1" ]]; then
+        restart_probe_service || true
+    fi
     return 1
+}
+
+update_probe_script() {
+    local repo="$1"
+    local url tmp_file
+
+    repo="${repo:-$AUTO_UPDATE_REPO_DEFAULT}"
+    url="https://raw.githubusercontent.com/${repo}/main/script/v2node-probe.sh"
+    tmp_file=$(mktemp)
+
+    if ! curl -fsSL --connect-timeout 8 --max-time 30 "$url" -o "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    if ! bash -n "$tmp_file"; then
+        rm -f "$tmp_file"
+        fail "下载到的探针脚本语法校验失败"
+        return 1
+    fi
+
+    if cmp -s "$tmp_file" "$0"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    install -m 0755 "$tmp_file" "$0"
+    rm -f "$tmp_file"
+    log "已更新探针脚本 $0"
+    return 0
+}
+
+restart_probe_service() {
+    log "探针脚本已更新，准备重启探针服务"
+
+    if command -v systemctl >/dev/null 2>&1 && timeout 3 systemctl list-units >/dev/null 2>&1; then
+        systemctl restart v2node-probe >/dev/null 2>&1 || true
+        exit 0
+    fi
+
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service v2node-probe restart >/dev/null 2>&1 || true
+        exit 0
+    fi
+
+    return 0
 }
 
 sha256_hex() {
