@@ -15,6 +15,7 @@ SINGBOX_VERSION="${V2NODE_PROBE_SINGBOX_VERSION:-1.12.0}"
 AUTO_UPDATE_INTERVAL_DEFAULT=86400
 AUTO_UPDATE_REPO_DEFAULT="YeJianbo/v2node"
 SYNC_INTERVAL_DEFAULT=30
+STATUS_INTERVAL_DEFAULT=5
 CONFIG_CHANGED=0
 GOST_CONFIG_CHANGED=0
 
@@ -42,6 +43,10 @@ load_state() {
     SYNC_INTERVAL="${SYNC_INTERVAL:-$SYNC_INTERVAL_DEFAULT}"
     if ! [[ "$SYNC_INTERVAL" =~ ^[0-9]+$ ]] || (( SYNC_INTERVAL < SYNC_INTERVAL_DEFAULT )); then
         SYNC_INTERVAL="$SYNC_INTERVAL_DEFAULT"
+    fi
+    STATUS_INTERVAL="${STATUS_INTERVAL:-$STATUS_INTERVAL_DEFAULT}"
+    if ! [[ "$STATUS_INTERVAL" =~ ^[0-9]+$ ]] || (( STATUS_INTERVAL < STATUS_INTERVAL_DEFAULT )); then
+        STATUS_INTERVAL="$STATUS_INTERVAL_DEFAULT"
     fi
 
     if [[ -z "$PANEL_URL" || -z "$MACHINE_TOKEN" || -z "$MACHINE_ID" ]]; then
@@ -2017,12 +2022,23 @@ sync_once() {
 daemon_loop() {
     load_state || return 1
     ensure_dependencies || return 1
+    local last_sync_at=0
+    local now
 
     trap 'exit 0' TERM INT
 
     while true; do
-        sync_once || true
-        sleep "${SYNC_INTERVAL:-$SYNC_INTERVAL_DEFAULT}"
+        load_state || true
+        now=$(date +%s)
+
+        if (( now - last_sync_at >= ${SYNC_INTERVAL:-$SYNC_INTERVAL_DEFAULT} )); then
+            sync_once || true
+            last_sync_at="$now"
+        else
+            push_status || true
+        fi
+
+        sleep "${STATUS_INTERVAL:-$STATUS_INTERVAL_DEFAULT}"
     done
 }
 
