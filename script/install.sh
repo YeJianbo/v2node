@@ -664,7 +664,7 @@ EOF
 PANEL_URL='${escaped_panel_url}'
 MACHINE_TOKEN='${escaped_machine_token}'
 MACHINE_ID='${MACHINE_ID_ARG}'
-SYNC_INTERVAL='15'
+SYNC_INTERVAL='30'
 EOF
 
     if [[ x"${release}" == x"alpine" ]]; then

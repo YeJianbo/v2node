@@ -10,9 +10,11 @@ UPDATE_STATE_FILE="${V2NODE_PROBE_UPDATE_STATE_FILE:-/etc/v2node/probe-update.st
 GOST_CONFIG_FILE="${V2NODE_PROBE_GOST_CONFIG_FILE:-/etc/gost/config.json}"
 GOST_BIN="${V2NODE_PROBE_GOST_BIN:-/usr/bin/gost}"
 GOST_VERSION="${V2NODE_PROBE_GOST_VERSION:-2.11.2}"
+SINGBOX_BIN="${V2NODE_PROBE_SINGBOX_BIN:-/usr/local/bin/sing-box-v2node-test}"
+SINGBOX_VERSION="${V2NODE_PROBE_SINGBOX_VERSION:-1.12.0}"
 AUTO_UPDATE_INTERVAL_DEFAULT=86400
 AUTO_UPDATE_REPO_DEFAULT="YeJianbo/v2node"
-SYNC_INTERVAL_DEFAULT=15
+SYNC_INTERVAL_DEFAULT=30
 CONFIG_CHANGED=0
 GOST_CONFIG_CHANGED=0
 
@@ -38,6 +40,9 @@ load_state() {
     MACHINE_TOKEN="${MACHINE_TOKEN:-}"
     MACHINE_ID="${MACHINE_ID:-}"
     SYNC_INTERVAL="${SYNC_INTERVAL:-$SYNC_INTERVAL_DEFAULT}"
+    if ! [[ "$SYNC_INTERVAL" =~ ^[0-9]+$ ]] || (( SYNC_INTERVAL < SYNC_INTERVAL_DEFAULT )); then
+        SYNC_INTERVAL="$SYNC_INTERVAL_DEFAULT"
+    fi
 
     if [[ -z "$PANEL_URL" || -z "$MACHINE_TOKEN" || -z "$MACHINE_ID" ]]; then
         fail "探针配置不完整，请检查 $STATE_FILE"
@@ -64,6 +69,10 @@ ensure_dependencies() {
     fi
     if ! command -v gzip >/dev/null 2>&1; then
         fail "缺少 gzip"
+        return 1
+    fi
+    if ! command -v tar >/dev/null 2>&1; then
+        fail "缺少 tar"
         return 1
     fi
 }
@@ -507,6 +516,78 @@ update_ddns_state() {
     DDNS_LAST_SYNCED_AT="${3:-$DDNS_LAST_SYNCED_AT}"
     DDNS_LAST_ERROR="${4:-$DDNS_LAST_ERROR}"
     save_ddns_state
+}
+
+detect_singbox_arch() {
+    case "$(uname -m 2>/dev/null)" in
+        x86_64|amd64)
+            printf 'amd64'
+            ;;
+        aarch64|arm64)
+            printf 'arm64'
+            ;;
+        armv7l|armv7)
+            printf 'armv7'
+            ;;
+        armv6l|armv6)
+            printf 'armv6'
+            ;;
+        i386|i686)
+            printf '386'
+            ;;
+        s390x)
+            printf 's390x'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_singbox_binary() {
+    if [[ -x "$SINGBOX_BIN" ]]; then
+        return 0
+    fi
+
+    local arch
+    local tmp_dir
+    local archive
+    local url
+    local binary_path
+
+    arch=$(detect_singbox_arch) || {
+        fail "当前架构不支持自动安装 sing-box"
+        return 1
+    }
+
+    tmp_dir=$(mktemp -d)
+    archive="${tmp_dir}/sing-box.tar.gz"
+    url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${arch}.tar.gz"
+
+    if ! curl -fsSL --connect-timeout 8 --max-time 120 "$url" -o "$archive"; then
+        rm -rf "$tmp_dir"
+        fail "下载 sing-box 失败: ${url}"
+        return 1
+    fi
+
+    if ! tar -xzf "$archive" -C "$tmp_dir"; then
+        rm -rf "$tmp_dir"
+        fail "解压 sing-box 失败"
+        return 1
+    fi
+
+    binary_path=$(find "$tmp_dir" -type f -name sing-box | head -n 1)
+    if [[ -z "$binary_path" || ! -f "$binary_path" ]]; then
+        rm -rf "$tmp_dir"
+        fail "未找到 sing-box 可执行文件"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$SINGBOX_BIN")"
+    cp "$binary_path" "$SINGBOX_BIN"
+    chmod +x "$SINGBOX_BIN"
+    rm -rf "$tmp_dir"
+    log "已安装 sing-box ${SINGBOX_VERSION}"
 }
 
 load_update_state() {
@@ -1560,6 +1641,158 @@ ack_enable_bbr() {
     signed_post_json "/api/v1/server/machine/bbrAck" "$body" >/dev/null
 }
 
+ack_connectivity_test() {
+    local task_id="$1"
+    local status="$2"
+    local message="$3"
+    local latency_ms="${4:-null}"
+    local http_code="${5:-null}"
+    local logs="${6:-}"
+    local body
+
+    body=$(jq -nc \
+        --arg task_id "$task_id" \
+        --arg status "$status" \
+        --arg message "$message" \
+        --argjson latency_ms "${latency_ms:-null}" \
+        --argjson http_code "${http_code:-null}" \
+        --arg logs "$logs" \
+        '{
+            task_id:$task_id,
+            status:$status,
+            message:$message,
+            latency_ms:$latency_ms,
+            http_code:$http_code,
+            logs:$logs
+        }')
+    signed_post_json "/api/v1/server/machine/connectivityTestAck" "$body" >/dev/null
+}
+
+pick_free_tcp_port() {
+    local port
+    local try
+    for try in $(seq 1 30); do
+        port=$((38000 + (RANDOM % 20000)))
+        if command -v ss >/dev/null 2>&1; then
+            if ! ss -ltn "( sport = :${port} )" 2>/dev/null | grep -q ":${port}"; then
+                printf '%s' "$port"
+                return 0
+            fi
+        else
+            printf '%s' "$port"
+            return 0
+        fi
+    done
+
+    printf '39080'
+}
+
+run_connectivity_test_task() {
+    local task_json="$1"
+    local task_id runner target_url timeout_seconds config_format config_base64 expected_codes_json
+    local tmp_dir config_file runtime_file log_file port pid curl_status curl_error output http_code latency_ms
+    local start_ms end_ms message status logs_tailed
+
+    task_id=$(printf '%s' "$task_json" | jq -r '.task_id // ""')
+    runner=$(printf '%s' "$task_json" | jq -r '.runner // "sing-box"')
+    target_url=$(printf '%s' "$task_json" | jq -r '.target_url // "https://cp.cloudflare.com/generate_204"')
+    timeout_seconds=$(printf '%s' "$task_json" | jq -r '(.timeout_seconds // 18) | tonumber')
+    config_format=$(printf '%s' "$task_json" | jq -r '.config_format // ""')
+    config_base64=$(printf '%s' "$task_json" | jq -r '.config_base64 // ""')
+    expected_codes_json=$(printf '%s' "$task_json" | jq -c '.expected_http_codes // [200,204]')
+
+    if [[ -z "$task_id" || -z "$config_base64" || "$config_format" != "sing-box" || "$runner" != "sing-box" ]]; then
+        ack_connectivity_test "$task_id" "failed" "测试任务参数不完整" null null "" || true
+        return 1
+    fi
+
+    ensure_singbox_binary || {
+        ack_connectivity_test "$task_id" "failed" "安装 sing-box 失败" null null "" || true
+        return 1
+    }
+
+    tmp_dir=$(mktemp -d)
+    config_file="${tmp_dir}/base.json"
+    runtime_file="${tmp_dir}/runtime.json"
+    log_file="${tmp_dir}/sing-box.log"
+    port=$(pick_free_tcp_port)
+
+    if ! printf '%s' "$config_base64" | base64 -d > "$config_file" 2>/dev/null; then
+        rm -rf "$tmp_dir"
+        ack_connectivity_test "$task_id" "failed" "解码测试配置失败" null null "" || true
+        return 1
+    fi
+
+    if ! jq --argjson port "$port" '
+        .inbounds = [{
+            tag: "mixed-in",
+            type: "mixed",
+            listen: "127.0.0.1",
+            listen_port: $port
+        }]
+    ' "$config_file" > "$runtime_file"; then
+        rm -rf "$tmp_dir"
+        ack_connectivity_test "$task_id" "failed" "生成运行配置失败" null null "" || true
+        return 1
+    fi
+
+    "$SINGBOX_BIN" run -D "$tmp_dir" -c "$runtime_file" >"$log_file" 2>&1 &
+    pid=$!
+
+    for _ in $(seq 1 24); do
+        if ! kill -0 "$pid" >/dev/null 2>&1; then
+            break
+        fi
+        if command -v ss >/dev/null 2>&1 && ss -ltn "( sport = :${port} )" 2>/dev/null | grep -q ":${port}"; then
+            break
+        fi
+        sleep 0.5
+    done
+
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+        logs_tailed=$(tail -n 20 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c 1-3500)
+        rm -rf "$tmp_dir"
+        ack_connectivity_test "$task_id" "failed" "sing-box 启动失败" null null "$logs_tailed" || true
+        return 1
+    fi
+
+    start_ms=$(date +%s%3N)
+    curl_error=$(mktemp)
+    output=$(curl -sS -o /dev/null -w "%{http_code}" \
+        --connect-timeout 6 \
+        --max-time "$timeout_seconds" \
+        --proxy "http://127.0.0.1:${port}" \
+        "$target_url" 2>"$curl_error")
+    curl_status=$?
+    end_ms=$(date +%s%3N)
+    latency_ms=$((end_ms - start_ms))
+    http_code=0
+    if [[ "$output" =~ ^[0-9]+$ ]]; then
+        http_code="$output"
+    fi
+
+    logs_tailed=$(tail -n 20 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c 1-3500)
+
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+    rm -f "$curl_error"
+    rm -rf "$tmp_dir"
+
+    status="failed"
+    message="真实协议测试失败"
+    if [[ "$curl_status" -eq 0 ]] && printf '%s' "$expected_codes_json" | jq -e --argjson code "$http_code" 'index($code) != null' >/dev/null 2>&1; then
+        status="success"
+        message="节点机器本机真实协议测试成功"
+    else
+        if [[ "$http_code" -gt 0 ]]; then
+            message="真实协议测试失败，HTTP ${http_code}"
+        fi
+    fi
+
+    ack_connectivity_test "$task_id" "$status" "$message" "$latency_ms" "$http_code" "$logs_tailed" || true
+    [[ "$status" == "success" ]]
+}
+
 enable_bbr_tuning() {
     local available current conf_file virtualization
 
@@ -1613,12 +1846,11 @@ sync_once() {
     load_state || return 1
     ensure_dependencies || return 1
 
-    push_status || true
-
     local api_path="/api/v1/server/machine/v2nodeConfig"
     local response
 
     if ! response=$(signed_get "$api_path" "t=$(date +%s)"); then
+        push_status || true
         fail "拉取探针配置失败: ${PANEL_URL}${api_path}"
         return 1
     fi
@@ -1635,6 +1867,8 @@ sync_once() {
     firewall_json=$(printf '%s' "$response" | jq -c '.probe.firewall_rules // []')
     local relay_json
     relay_json=$(printf '%s' "$response" | jq -c '.probe.relay // {}')
+    local connectivity_test_json
+    connectivity_test_json=$(printf '%s' "$response" | jq -c '.probe.connectivity_test_task // null')
     local combined_firewall_json
     combined_firewall_json=$(jq -cn \
         --argjson firewall "$firewall_json" \
@@ -1685,6 +1919,9 @@ sync_once() {
     sync_relay_config "$relay_json" || true
     sync_firewall "$combined_firewall_json" || true
     write_config "$nodes_json"
+    if [[ -n "$connectivity_test_json" && "$connectivity_test_json" != "null" ]]; then
+        run_connectivity_test_task "$connectivity_test_json" || true
+    fi
 
     if [[ "${CONFIG_CHANGED:-0}" == "1" ]]; then
         restart_required=1
