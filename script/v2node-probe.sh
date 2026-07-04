@@ -449,8 +449,10 @@ get_gost_version() {
 sync_relay_config() {
     local relay_json="$1"
     local relay_rules_json
+    local previous_gost_config
+    local had_previous_gost_config=0
 
-    relay_rules_json=$(printf '%s' "$relay_json" | jq -c '
+    if ! relay_rules_json=$(printf '%s' "$relay_json" | jq -c '
         (.rules // [])
         | map({
             listen_host: (.listen_host // "0.0.0.0"),
@@ -465,23 +467,52 @@ sync_relay_config() {
             )
         })
         | map(select(.listen_port >= 1 and .listen_port <= 65535 and .target_port >= 1 and .target_port <= 65535))
-    ')
+    '); then
+        fail "解析 gost 转发规则失败，保留当前转发配置"
+        return 1
+    fi
+
+    previous_gost_config=$(mktemp)
+    if [[ -f "$GOST_CONFIG_FILE" ]]; then
+        cp "$GOST_CONFIG_FILE" "$previous_gost_config"
+        had_previous_gost_config=1
+    fi
 
     if [[ "$(printf '%s' "$relay_rules_json" | jq 'length')" -eq 0 ]]; then
         cleanup_gost_config
+        rm -f "$previous_gost_config"
         return 0
     fi
 
-    ensure_gost_binary || return 1
-    ensure_gost_service || return 1
-    write_gost_config "$relay_rules_json" || return 1
+    ensure_gost_binary || {
+        rm -f "$previous_gost_config"
+        return 1
+    }
+    ensure_gost_service || {
+        rm -f "$previous_gost_config"
+        return 1
+    }
+    write_gost_config "$relay_rules_json" || {
+        rm -f "$previous_gost_config"
+        return 1
+    }
 
     if [[ "${GOST_CONFIG_CHANGED:-0}" == "1" ]]; then
         restart_gost_service || {
-            fail "重启 gost 服务失败"
+            fail "重启 gost 服务失败，恢复上一份转发配置"
+            if [[ "$had_previous_gost_config" == "1" ]]; then
+                mkdir -p "$(dirname "$GOST_CONFIG_FILE")"
+                mv "$previous_gost_config" "$GOST_CONFIG_FILE"
+                restart_gost_service || true
+            else
+                rm -f "$GOST_CONFIG_FILE" "$previous_gost_config"
+                stop_gost_service || true
+            fi
             return 1
         }
     fi
+
+    rm -f "$previous_gost_config"
 }
 
 load_ddns_state() {
@@ -1901,6 +1932,12 @@ sync_once() {
     fi
 
     local restart_required=0
+    local previous_v2node_config
+    local previous_managed_nodes_state
+    local had_previous_v2node_config=0
+    local had_previous_managed_nodes_state=0
+    previous_v2node_config=$(mktemp)
+    previous_managed_nodes_state=$(mktemp)
 
     if [[ -n "$enable_bbr_token" && "$enable_bbr_token" != "null" ]]; then
         local bbr_error_file
@@ -1918,7 +1955,18 @@ sync_once() {
     sync_ddns "$ddns_json" || true
     sync_relay_config "$relay_json" || true
     sync_firewall "$combined_firewall_json" || true
-    write_config "$nodes_json"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        cp "$CONFIG_FILE" "$previous_v2node_config"
+        had_previous_v2node_config=1
+    fi
+    if [[ -f "$MANAGED_NODES_STATE_FILE" ]]; then
+        cp "$MANAGED_NODES_STATE_FILE" "$previous_managed_nodes_state"
+        had_previous_managed_nodes_state=1
+    fi
+    if ! write_config "$nodes_json"; then
+        rm -f "$previous_v2node_config" "$previous_managed_nodes_state"
+        return 1
+    fi
     if [[ -n "$connectivity_test_json" && "$connectivity_test_json" != "null" ]]; then
         run_connectivity_test_task "$connectivity_test_json" || true
     fi
@@ -1937,10 +1985,29 @@ sync_once() {
                 ack_restart_v2node "$restart_token" || true
             fi
         else
-            fail "重启 v2node 节点服务失败"
+            fail "重启 v2node 节点服务失败，恢复上一份节点配置"
+            if [[ "${CONFIG_CHANGED:-0}" == "1" ]]; then
+                if [[ "$had_previous_v2node_config" == "1" ]]; then
+                    mkdir -p "$(dirname "$CONFIG_FILE")"
+                    mv "$previous_v2node_config" "$CONFIG_FILE"
+                else
+                    rm -f "$CONFIG_FILE" "$previous_v2node_config"
+                fi
+
+                if [[ "$had_previous_managed_nodes_state" == "1" ]]; then
+                    mkdir -p "$(dirname "$MANAGED_NODES_STATE_FILE")"
+                    mv "$previous_managed_nodes_state" "$MANAGED_NODES_STATE_FILE"
+                else
+                    rm -f "$MANAGED_NODES_STATE_FILE" "$previous_managed_nodes_state"
+                fi
+                restart_v2node_service || true
+            fi
+            rm -f "$previous_v2node_config" "$previous_managed_nodes_state"
             return 1
         fi
     fi
+
+    rm -f "$previous_v2node_config" "$previous_managed_nodes_state"
 
     maybe_auto_update "$auto_update_json" || true
 
