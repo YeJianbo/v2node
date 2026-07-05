@@ -1345,6 +1345,50 @@ read_listen_ports() {
     printf ''
 }
 
+read_listen_processes() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -lntup 2>/dev/null | awk '
+            {
+                proto=tolower($1)
+                addr=$5
+                gsub(/^\[/, "", addr)
+                gsub(/\]$/, "", addr)
+                n=split(addr, parts, ":")
+                port=parts[n]
+                if (port !~ /^[0-9]+$/) next
+
+                raw=$0
+                proc=""
+                if (raw ~ /users:\(\("[^"]+"/) {
+                    sub(/^.*users:\(\("/, "", raw)
+                    sub(/".*$/, "", raw)
+                    proc=raw
+                }
+
+                rawPid=$0
+                pid=""
+                if (rawPid ~ /pid=[0-9]+/) {
+                    sub(/^.*pid=/, "", rawPid)
+                    sub(/[^0-9].*$/, "", rawPid)
+                    pid=rawPid
+                }
+
+                if (proc == "") proc="unknown"
+                key=proto ":" port ":" proc ":" pid
+                if (!seen[key]++) values[++count]=key
+            }
+            END {
+                for (i=1; i<=count && i<=80; i++) {
+                    printf "%s%s", i == 1 ? "" : ",", values[i]
+                }
+            }
+        '
+        return
+    fi
+
+    printf ''
+}
+
 is_global_ipv4() {
     local ip="$1"
 
@@ -1467,7 +1511,7 @@ push_status() {
     local v2node_version probe_update_checked_at probe_update_latest_version probe_update_error
     local local_ipv4 local_ipv6 public_ipv4 public_ipv6
     local mem_total mem_used swap_total swap_used swap_percent disk_total disk_used cpu_cores cpu_model os_name kernel arch
-    local load_json docker_json connection_json v2node_status gost_status listen_ports process_count virtualization tcp_cc docker_summary
+    local load_json docker_json connection_json v2node_status gost_status listen_ports listen_processes process_count virtualization tcp_cc docker_summary
     cpu=$(read_cpu_percent)
     mem=$(read_mem_percent)
     disk=$(read_disk_percent)
@@ -1502,6 +1546,7 @@ push_status() {
     v2node_status=$(read_service_status v2node)
     gost_status=$(read_service_status gost)
     listen_ports=$(read_listen_ports)
+    listen_processes=$(read_listen_processes)
     uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d'.' -f1)
     version="v2node-probe $(uname -s 2>/dev/null) $(uname -m 2>/dev/null)"
     v2node_version=$(get_local_v2node_version)
@@ -1568,6 +1613,7 @@ push_status() {
         --arg v2node_status "${v2node_status:-unknown}" \
         --arg gost_status "${gost_status:-unknown}" \
         --arg listen_ports "${listen_ports:-}" \
+        --arg listen_processes "${listen_processes:-}" \
         '{
             cpu:$cpu,
             mem:$mem,
@@ -1622,7 +1668,8 @@ push_status() {
             probe_update_error:$probe_update_error,
             v2node_status:$v2node_status,
             gost_status:$gost_status,
-            listen_ports:$listen_ports
+            listen_ports:$listen_ports,
+            listen_processes:$listen_processes
         }')
 
     signed_post_json "/api/v1/server/machine/push" "$body" >/dev/null
