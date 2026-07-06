@@ -270,12 +270,22 @@ generate_v2node_config() {
                 --arg api_host "$api_host" \
                 --argjson node_id "$node_id" \
                 --arg api_key "$api_key" \
-                '.Nodes = ((if (.Nodes | type) == "array" then .Nodes else [] end) + [{
+                '
+                def normalized_node_id:
+                    ((.NodeID // .node_id // 0) | tonumber? // 0);
+
+                {
                     "ApiHost": $api_host,
                     "NodeID": $node_id,
                     "ApiKey": $api_key,
                     "Timeout": 15
-                }])' \
+                } as $newNode
+                | .Nodes = (
+                    ((if (.Nodes | type) == "array" then .Nodes else [] end)
+                    | map(select((normalized_node_id == $node_id) | not)))
+                    + [$newNode]
+                )
+                ' \
                 "$config_file" > "$tmp_file"; then
                 echo -e "${red}追加节点到配置文件失败${plain}"
                 rm -f "$tmp_file"

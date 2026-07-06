@@ -1711,17 +1711,38 @@ write_config() {
         --slurpfile previous_managed "$managed_state_file" \
         --argjson desired_nodes "$nodes_json" \
         '
+        def normalized_api_host:
+            (.ApiHost // .api_host // "" | tostring | ascii_downcase | sub("/+$"; ""));
+        def normalized_node_id:
+            ((.NodeID // .node_id // 0) | tonumber? // 0);
         def node_key:
             [
-                (.ApiHost // .api_host // "" | tostring),
-                ((.NodeID // .node_id // 0) | tostring)
+                normalized_api_host,
+                (normalized_node_id | tostring)
             ] | join("#");
+        def node_identity:
+            normalized_node_id as $id
+            | if $id > 0 then ($id | tostring) else node_key end;
+        def unique_by_identity:
+            reduce .[] as $node ({seen:{}, out:[]};
+                ($node | node_identity) as $key
+                | if $key == "" or (.seen[$key] // false) then .
+                  else (.seen[$key] = true) | (.out += [$node])
+                  end
+            ) | .out;
 
         ($existing[0] // {}) as $old
         | (($previous_managed[0] // []) | map(tostring)) as $previousKeys
-        | ($desired_nodes // []) as $desired
-        | (($old.Nodes // []) | map(select((node_key as $key | $previousKeys | index($key)) | not))) as $manualNodes
-        | ($desired | map(select(node_key as $key | ($manualNodes | map(node_key) | index($key)) | not))) as $newManagedNodes
+        | ($previousKeys | map(split("#") | .[-1])) as $previousNodeIds
+        | (($desired_nodes // []) | unique_by_identity) as $desired
+        | (($old.Nodes // [])
+            | map(select(
+                (node_key as $key | $previousKeys | index($key)) as $matchedKey
+                | (node_identity as $identity | $previousNodeIds | index($identity)) as $matchedId
+                | ($matchedKey or $matchedId) | not
+            ))
+            | unique_by_identity) as $manualNodes
+        | ($desired | map(select(node_identity as $identity | ($manualNodes | map(node_identity) | index($identity)) | not))) as $newManagedNodes
         | $old
         | .Log = (.Log // {
             Level: "warning",
@@ -1736,12 +1757,19 @@ write_config() {
     fi
 
     if ! printf '%s' "$nodes_json" | jq -c '
+        def normalized_api_host:
+            (.ApiHost // .api_host // "" | tostring | ascii_downcase | sub("/+$"; ""));
+        def normalized_node_id:
+            ((.NodeID // .node_id // 0) | tonumber? // 0);
         def node_key:
             [
-                (.ApiHost // .api_host // "" | tostring),
-                ((.NodeID // .node_id // 0) | tostring)
+                normalized_api_host,
+                (normalized_node_id | tostring)
             ] | join("#");
-        map(node_key) | unique
+        def node_identity:
+            normalized_node_id as $id
+            | if $id > 0 then ($id | tostring) else node_key end;
+        map(node_identity) | unique
     ' > "$next_state_file"; then
         rm -f "$tmp_file" "$existing_config_file" "$managed_state_file" "$next_state_file"
         fail "生成探针节点状态失败"
