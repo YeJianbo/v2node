@@ -17,6 +17,19 @@ wget -N https://raw.githubusercontent.com/YeJianbo/v2node/main/script/install.sh
 GOEXPERIMENT=jsonv2 go build -v -o build_assets/v2node -trimpath -ldflags "-X 'github.com/wyx2685/v2node/cmd.version=$version' -s -w -buildid="
 ```
 
+## 配置加密
+
+支持将节点配置文件加密后落盘，运行时通过环境变量解密：
+
+```bash
+v2node config keygen
+export BUNCLOUD_CONFIG_KEY='上一步输出的密钥'
+v2node config encrypt --in /etc/v2node/config.json --out /etc/.buncloud-agent/config.enc.json
+v2node server -c /etc/.buncloud-agent/config.enc.json
+```
+
+兼容旧环境变量 `V2NODE_CONFIG_KEY`。
+
 ## Stars 增长记录
 
 [![Stargazers over time](https://starchart.cc/wyx2685/v2node.svg?variant=adaptive)](https://starchart.cc/wyx2685/v2node)

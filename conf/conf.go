@@ -1,10 +1,12 @@
 package conf
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 
 	"github.com/spf13/viper"
+	"github.com/wyx2685/v2node/common/crypt"
 )
 
 const DefaultNodeRetryCount = 1
@@ -41,14 +43,21 @@ func New() *Conf {
 }
 
 func (p *Conf) LoadFromPath(filePath string) error {
-	f, err := os.Open(filePath)
+	raw, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("open config file error: %s", err)
 	}
-	defer f.Close()
+	plain, err := crypt.MaybeDecryptConfig(raw)
+	if err != nil {
+		return fmt.Errorf("decode config file error: %s", err)
+	}
+	return p.LoadFromBytes(plain)
+}
+
+func (p *Conf) LoadFromBytes(data []byte) error {
 	v := viper.New()
-	v.SetConfigFile(filePath)
-	if err := v.ReadInConfig(); err != nil {
+	v.SetConfigType("json")
+	if err := v.ReadConfig(bytes.NewReader(data)); err != nil {
 		return fmt.Errorf("read config file error: %s", err)
 	}
 	if err := v.Unmarshal(p); err != nil {

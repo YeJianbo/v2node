@@ -6,7 +6,9 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 
 	log "github.com/sirupsen/logrus"
@@ -24,7 +26,7 @@ var (
 
 var serverCommand = cobra.Command{
 	Use:   "server",
-	Short: "Run v2node server",
+	Short: "Run BunCloud managed agent",
 	Run:   serverHandle,
 	Args:  cobra.NoArgs,
 }
@@ -32,11 +34,38 @@ var serverCommand = cobra.Command{
 func init() {
 	serverCommand.PersistentFlags().
 		StringVarP(&config, "config", "c",
-			"/etc/v2node/config.json", "config file path")
+			resolveDefaultConfigPath(), "config file path")
 	serverCommand.PersistentFlags().
 		BoolVarP(&watch, "watch", "w",
 			true, "watch file path change")
 	command.AddCommand(&serverCommand)
+}
+
+func resolveDefaultConfigPath() string {
+	candidates := []string{
+		strings.TrimSpace(os.Getenv("BUNCLOUD_CONFIG_PATH")),
+		strings.TrimSpace(os.Getenv("V2NODE_CONFIG_PATH")),
+		"/etc/.buncloud-agent/config.enc.json",
+		"/etc/.buncloud-agent/config.json",
+		"/etc/v2node/config.json",
+	}
+
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	if candidates[0] != "" {
+		return filepath.Clean(candidates[0])
+	}
+	if candidates[1] != "" {
+		return filepath.Clean(candidates[1])
+	}
+	return "/etc/.buncloud-agent/config.enc.json"
 }
 
 func serverHandle(_ *cobra.Command, _ []string) {
