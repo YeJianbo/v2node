@@ -2,11 +2,21 @@
 
 set -u
 
-STATE_FILE="${V2NODE_PROBE_STATE_FILE:-/etc/v2node/probe.env}"
-CONFIG_FILE="${V2NODE_CONFIG_FILE:-/etc/v2node/config.json}"
-MANAGED_NODES_STATE_FILE="${V2NODE_PROBE_MANAGED_NODES_STATE_FILE:-/etc/v2node/probe-managed-nodes.json}"
-DDNS_STATE_FILE="${V2NODE_PROBE_DDNS_STATE_FILE:-/etc/v2node/probe-ddns.state}"
-UPDATE_STATE_FILE="${V2NODE_PROBE_UPDATE_STATE_FILE:-/etc/v2node/probe-update.state}"
+DEFAULT_CONFIG_DIR="/etc/.buncloud-agent"
+LEGACY_CONFIG_DIR="/etc/v2node"
+RUNTIME_ENV_FILE="${V2NODE_RUNTIME_ENV_FILE:-${DEFAULT_CONFIG_DIR}/runtime.env}"
+if [[ -f "$RUNTIME_ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$RUNTIME_ENV_FILE"
+fi
+
+CONFIG_DIR="${V2NODE_CONFIG_DIR:-${DEFAULT_CONFIG_DIR}}"
+STATE_FILE="${V2NODE_PROBE_STATE_FILE:-${CONFIG_DIR}/probe-state.json}"
+CONFIG_FILE="${V2NODE_CONFIG_FILE:-${BUNCLOUD_CONFIG_PATH:-${CONFIG_DIR}/config.enc.json}}"
+CONFIG_KEY_FILE="${V2NODE_CONFIG_KEY_FILE:-${CONFIG_DIR}/config.key}"
+MANAGED_NODES_STATE_FILE="${V2NODE_PROBE_MANAGED_NODES_STATE_FILE:-${CONFIG_DIR}/probe-managed-nodes.json}"
+DDNS_STATE_FILE="${V2NODE_PROBE_DDNS_STATE_FILE:-${CONFIG_DIR}/probe-ddns.json}"
+UPDATE_STATE_FILE="${V2NODE_PROBE_UPDATE_STATE_FILE:-${CONFIG_DIR}/probe-update.json}"
 GOST_CONFIG_FILE="${V2NODE_PROBE_GOST_CONFIG_FILE:-/etc/gost/config.json}"
 GOST_CONFIG_BACKUP_FILE="${V2NODE_PROBE_GOST_CONFIG_BACKUP_FILE:-/etc/gost/config.json.last-good}"
 GOST_BIN="${V2NODE_PROBE_GOST_BIN:-/usr/bin/gost}"
@@ -29,18 +39,95 @@ fail() {
     return 1
 }
 
+ensure_private_dir() {
+    mkdir -p "$1" >/dev/null 2>&1
+    chmod 700 "$1" >/dev/null 2>&1 || true
+}
+
+read_config_key() {
+    if [[ -n "${BUNCLOUD_CONFIG_KEY:-}" ]]; then
+        printf '%s' "$BUNCLOUD_CONFIG_KEY"
+        return 0
+    fi
+    if [[ -n "${V2NODE_CONFIG_KEY:-}" ]]; then
+        printf '%s' "$V2NODE_CONFIG_KEY"
+        return 0
+    fi
+    if [[ -s "$CONFIG_KEY_FILE" ]]; then
+        tr -d '\r\n' < "$CONFIG_KEY_FILE"
+        return 0
+    fi
+    return 1
+}
+
+decrypt_config_to_file() {
+    local output_file="$1"
+    local key
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        key=$(read_config_key) || return 1
+        /usr/local/v2node/v2node config decrypt --in "$CONFIG_FILE" --out "$output_file" --key "$key" >/dev/null 2>&1
+        return $?
+    fi
+
+    if [[ -f "${CONFIG_DIR}/config.json" ]]; then
+        cp "${CONFIG_DIR}/config.json" "$output_file"
+        return 0
+    fi
+
+    if [[ -f "${LEGACY_CONFIG_DIR}/config.json" ]]; then
+        cp "${LEGACY_CONFIG_DIR}/config.json" "$output_file"
+        return 0
+    fi
+
+    return 1
+}
+
+encrypt_config_from_file() {
+    local input_file="$1"
+    local key
+
+    key=$(read_config_key) || return 1
+    ensure_private_dir "$CONFIG_DIR"
+    /usr/local/v2node/v2node config encrypt --in "$input_file" --out "$CONFIG_FILE" --key "$key" >/dev/null 2>&1 || return 1
+    chmod 600 "$CONFIG_FILE" >/dev/null 2>&1 || true
+    rm -f "${CONFIG_DIR}/config.json" "${LEGACY_CONFIG_DIR}/config.json"
+}
+
+seed_plain_config_file() {
+    local output_file="$1"
+    jq -n '{
+        Log: {
+            Level: "warning",
+            Output: "",
+            Access: "none"
+        },
+        Nodes: []
+    }' > "$output_file"
+}
+
 load_state() {
     if [[ ! -f "$STATE_FILE" ]]; then
         fail "未找到探针配置文件: $STATE_FILE"
         return 1
     fi
 
-    # shellcheck disable=SC1090
-    source "$STATE_FILE"
+    if jq -e 'type == "object"' "$STATE_FILE" >/dev/null 2>&1; then
+        PANEL_URL=$(jq -r '.panel_url // ""' "$STATE_FILE")
+        MACHINE_TOKEN=$(jq -r '.machine_token // ""' "$STATE_FILE")
+        MACHINE_ID=$(jq -r '.machine_id // ""' "$STATE_FILE")
+        SYNC_INTERVAL=$(jq -r '.sync_interval // empty' "$STATE_FILE")
+        STATUS_INTERVAL=$(jq -r '.status_interval // empty' "$STATE_FILE")
+    else
+        # shellcheck disable=SC1090
+        source "$STATE_FILE"
+        PANEL_URL="${PANEL_URL:-}"
+        MACHINE_TOKEN="${MACHINE_TOKEN:-}"
+        MACHINE_ID="${MACHINE_ID:-}"
+        SYNC_INTERVAL="${SYNC_INTERVAL:-}"
+        STATUS_INTERVAL="${STATUS_INTERVAL:-}"
+    fi
 
-    PANEL_URL="${PANEL_URL:-}"
-    MACHINE_TOKEN="${MACHINE_TOKEN:-}"
-    MACHINE_ID="${MACHINE_ID:-}"
     SYNC_INTERVAL="${SYNC_INTERVAL:-$SYNC_INTERVAL_DEFAULT}"
     if ! [[ "$SYNC_INTERVAL" =~ ^[0-9]+$ ]] || (( SYNC_INTERVAL < SYNC_INTERVAL_DEFAULT )); then
         SYNC_INTERVAL="$SYNC_INTERVAL_DEFAULT"
@@ -427,10 +514,8 @@ write_gost_config() {
 
     if [[ "$(printf '%s' "$serve_nodes" | jq 'length')" -eq 0 ]]; then
         rm -f "$tmp_file"
-        if [[ ! -f "$GOST_CONFIG_FILE" ]]; then
-            restore_last_good_gost_config || true
-        fi
-        log "本次转发规则为空，保留当前 gost 配置"
+        cleanup_gost_config
+        log "本次转发规则为空，已清理 gost 配置并停止服务"
         return 0
     fi
 
@@ -512,13 +597,8 @@ sync_relay_config() {
     fi
 
     if [[ "$(printf '%s' "$relay_rules_json" | jq 'length')" -eq 0 ]]; then
-        if [[ ! -f "$GOST_CONFIG_FILE" ]]; then
-            restore_last_good_gost_config || true
-            if [[ "${GOST_CONFIG_CHANGED:-0}" == "1" ]]; then
-                restart_gost_service || true
-            fi
-        fi
-        log "本次下发转发规则为空，保留当前 gost 配置"
+        cleanup_gost_config
+        log "本次下发转发规则为空，已清理 gost 配置并停止服务"
         rm -f "$previous_gost_config"
         return 0
     fi
@@ -555,29 +635,55 @@ sync_relay_config() {
 }
 
 load_ddns_state() {
+    DDNS_ZONE_ID=""
+    DDNS_RECORD_ID=""
+    DDNS_LAST_IP=""
+    DDNS_LAST_HOST=""
+    DDNS_LAST_SYNCED_AT="0"
+    DDNS_LAST_ERROR=""
+
+    if [[ ! -f "$DDNS_STATE_FILE" ]]; then
+        return
+    fi
+
+    if jq -e 'type == "object"' "$DDNS_STATE_FILE" >/dev/null 2>&1; then
+        DDNS_ZONE_ID=$(jq -r '.zone_id // ""' "$DDNS_STATE_FILE")
+        DDNS_RECORD_ID=$(jq -r '.record_id // ""' "$DDNS_STATE_FILE")
+        DDNS_LAST_IP=$(jq -r '.last_ip // ""' "$DDNS_STATE_FILE")
+        DDNS_LAST_HOST=$(jq -r '.last_host // ""' "$DDNS_STATE_FILE")
+        DDNS_LAST_SYNCED_AT=$(jq -r '.last_synced_at // 0' "$DDNS_STATE_FILE")
+        DDNS_LAST_ERROR=$(jq -r '.last_error // ""' "$DDNS_STATE_FILE")
+        return
+    fi
+
+    # shellcheck disable=SC1090
+    source "$DDNS_STATE_FILE"
     DDNS_ZONE_ID="${DDNS_ZONE_ID:-}"
     DDNS_RECORD_ID="${DDNS_RECORD_ID:-}"
     DDNS_LAST_IP="${DDNS_LAST_IP:-}"
     DDNS_LAST_HOST="${DDNS_LAST_HOST:-}"
     DDNS_LAST_SYNCED_AT="${DDNS_LAST_SYNCED_AT:-0}"
     DDNS_LAST_ERROR="${DDNS_LAST_ERROR:-}"
-
-    if [[ -f "$DDNS_STATE_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$DDNS_STATE_FILE"
-    fi
 }
 
 save_ddns_state() {
-    mkdir -p "$(dirname "$DDNS_STATE_FILE")"
-    cat > "$DDNS_STATE_FILE" <<EOF
-DDNS_ZONE_ID='${DDNS_ZONE_ID//\'/\'\"\'\"\'}'
-DDNS_RECORD_ID='${DDNS_RECORD_ID//\'/\'\"\'\"\'}'
-DDNS_LAST_IP='${DDNS_LAST_IP//\'/\'\"\'\"\'}'
-DDNS_LAST_HOST='${DDNS_LAST_HOST//\'/\'\"\'\"\'}'
-DDNS_LAST_SYNCED_AT='${DDNS_LAST_SYNCED_AT//\'/\'\"\'\"\'}'
-DDNS_LAST_ERROR='${DDNS_LAST_ERROR//\'/\'\"\'\"\'}'
-EOF
+    ensure_private_dir "$(dirname "$DDNS_STATE_FILE")"
+    jq -n \
+        --arg zone_id "${DDNS_ZONE_ID:-}" \
+        --arg record_id "${DDNS_RECORD_ID:-}" \
+        --arg last_ip "${DDNS_LAST_IP:-}" \
+        --arg last_host "${DDNS_LAST_HOST:-}" \
+        --argjson last_synced_at "${DDNS_LAST_SYNCED_AT:-0}" \
+        --arg last_error "${DDNS_LAST_ERROR:-}" \
+        '{
+            zone_id: $zone_id,
+            record_id: $record_id,
+            last_ip: $last_ip,
+            last_host: $last_host,
+            last_synced_at: $last_synced_at,
+            last_error: $last_error
+        }' > "$DDNS_STATE_FILE"
+    chmod 600 "$DDNS_STATE_FILE" >/dev/null 2>&1 || true
 }
 
 update_ddns_state() {
@@ -661,29 +767,55 @@ ensure_singbox_binary() {
 }
 
 load_update_state() {
+    PROBE_AUTO_UPDATE_ENABLED="false"
+    PROBE_AUTO_UPDATE_INTERVAL="$AUTO_UPDATE_INTERVAL_DEFAULT"
+    PROBE_AUTO_UPDATE_REPO="$AUTO_UPDATE_REPO_DEFAULT"
+    PROBE_UPDATE_LAST_CHECKED_AT="0"
+    PROBE_UPDATE_LAST_VERSION=""
+    PROBE_UPDATE_LAST_ERROR=""
+
+    if [[ ! -f "$UPDATE_STATE_FILE" ]]; then
+        return
+    fi
+
+    if jq -e 'type == "object"' "$UPDATE_STATE_FILE" >/dev/null 2>&1; then
+        PROBE_AUTO_UPDATE_ENABLED=$(jq -r '.enabled // false' "$UPDATE_STATE_FILE")
+        PROBE_AUTO_UPDATE_INTERVAL=$(jq -r '.interval // 86400' "$UPDATE_STATE_FILE")
+        PROBE_AUTO_UPDATE_REPO=$(jq -r '.repo // "YeJianbo/v2node"' "$UPDATE_STATE_FILE")
+        PROBE_UPDATE_LAST_CHECKED_AT=$(jq -r '.last_checked_at // 0' "$UPDATE_STATE_FILE")
+        PROBE_UPDATE_LAST_VERSION=$(jq -r '.last_version // ""' "$UPDATE_STATE_FILE")
+        PROBE_UPDATE_LAST_ERROR=$(jq -r '.last_error // ""' "$UPDATE_STATE_FILE")
+        return
+    fi
+
+    # shellcheck disable=SC1090
+    source "$UPDATE_STATE_FILE"
     PROBE_AUTO_UPDATE_ENABLED="${PROBE_AUTO_UPDATE_ENABLED:-false}"
     PROBE_AUTO_UPDATE_INTERVAL="${PROBE_AUTO_UPDATE_INTERVAL:-$AUTO_UPDATE_INTERVAL_DEFAULT}"
     PROBE_AUTO_UPDATE_REPO="${PROBE_AUTO_UPDATE_REPO:-$AUTO_UPDATE_REPO_DEFAULT}"
     PROBE_UPDATE_LAST_CHECKED_AT="${PROBE_UPDATE_LAST_CHECKED_AT:-0}"
     PROBE_UPDATE_LAST_VERSION="${PROBE_UPDATE_LAST_VERSION:-}"
     PROBE_UPDATE_LAST_ERROR="${PROBE_UPDATE_LAST_ERROR:-}"
-
-    if [[ -f "$UPDATE_STATE_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$UPDATE_STATE_FILE"
-    fi
 }
 
 save_update_state() {
-    mkdir -p "$(dirname "$UPDATE_STATE_FILE")"
-    cat > "$UPDATE_STATE_FILE" <<EOF
-PROBE_AUTO_UPDATE_ENABLED='${PROBE_AUTO_UPDATE_ENABLED//\'/\'\"\'\"\'}'
-PROBE_AUTO_UPDATE_INTERVAL='${PROBE_AUTO_UPDATE_INTERVAL//\'/\'\"\'\"\'}'
-PROBE_AUTO_UPDATE_REPO='${PROBE_AUTO_UPDATE_REPO//\'/\'\"\'\"\'}'
-PROBE_UPDATE_LAST_CHECKED_AT='${PROBE_UPDATE_LAST_CHECKED_AT//\'/\'\"\'\"\'}'
-PROBE_UPDATE_LAST_VERSION='${PROBE_UPDATE_LAST_VERSION//\'/\'\"\'\"\'}'
-PROBE_UPDATE_LAST_ERROR='${PROBE_UPDATE_LAST_ERROR//\'/\'\"\'\"\'}'
-EOF
+    ensure_private_dir "$(dirname "$UPDATE_STATE_FILE")"
+    jq -n \
+        --arg enabled "${PROBE_AUTO_UPDATE_ENABLED:-false}" \
+        --argjson interval "${PROBE_AUTO_UPDATE_INTERVAL:-$AUTO_UPDATE_INTERVAL_DEFAULT}" \
+        --arg repo "${PROBE_AUTO_UPDATE_REPO:-$AUTO_UPDATE_REPO_DEFAULT}" \
+        --argjson last_checked_at "${PROBE_UPDATE_LAST_CHECKED_AT:-0}" \
+        --arg last_version "${PROBE_UPDATE_LAST_VERSION:-}" \
+        --arg last_error "${PROBE_UPDATE_LAST_ERROR:-}" \
+        '{
+            enabled: ($enabled == "true"),
+            interval: $interval,
+            repo: $repo,
+            last_checked_at: $last_checked_at,
+            last_version: $last_version,
+            last_error: $last_error
+        }' > "$UPDATE_STATE_FILE"
+    chmod 600 "$UPDATE_STATE_FILE" >/dev/null 2>&1 || true
 }
 
 get_local_v2node_version() {
@@ -1687,17 +1819,10 @@ write_config() {
     managed_state_file=$(mktemp)
     next_state_file=$(mktemp)
 
-    if [[ -f "$CONFIG_FILE" ]] && jq -e 'type == "object"' "$CONFIG_FILE" >/dev/null 2>&1; then
-        cp "$CONFIG_FILE" "$existing_config_file"
+    if decrypt_config_to_file "$existing_config_file" && jq -e 'type == "object"' "$existing_config_file" >/dev/null 2>&1; then
+        :
     else
-        jq -n '{
-            Log: {
-                Level: "warning",
-                Output: "",
-                Access: "none"
-            },
-            Nodes: []
-        }' > "$existing_config_file"
+        seed_plain_config_file "$existing_config_file"
     fi
 
     if [[ -f "$MANAGED_NODES_STATE_FILE" ]] && jq -e 'type == "array"' "$MANAGED_NODES_STATE_FILE" >/dev/null 2>&1; then
@@ -1785,13 +1910,18 @@ write_config() {
         return 1
     fi
 
-    mkdir -p "$(dirname "$CONFIG_FILE")"
-    mkdir -p "$(dirname "$MANAGED_NODES_STATE_FILE")"
+    ensure_private_dir "$(dirname "$CONFIG_FILE")"
+    ensure_private_dir "$(dirname "$MANAGED_NODES_STATE_FILE")"
 
-    if [[ -f "$CONFIG_FILE" ]] && cmp -s "$tmp_file" "$CONFIG_FILE"; then
+    if cmp -s "$tmp_file" "$existing_config_file"; then
         rm -f "$tmp_file"
     else
-        mv "$tmp_file" "$CONFIG_FILE"
+        if ! encrypt_config_from_file "$tmp_file"; then
+            rm -f "$tmp_file" "$existing_config_file" "$managed_state_file" "$next_state_file"
+            fail "写入加密配置失败"
+            return 1
+        fi
+        rm -f "$tmp_file"
         CONFIG_CHANGED=1
         log "已更新 $CONFIG_FILE"
     fi
@@ -2110,10 +2240,13 @@ sync_once() {
 
     local restart_required=0
     local previous_v2node_config
+    local previous_v2node_plain_config
     local previous_managed_nodes_state
     local had_previous_v2node_config=0
+    local had_previous_v2node_plain_config=0
     local had_previous_managed_nodes_state=0
     previous_v2node_config=$(mktemp)
+    previous_v2node_plain_config=$(mktemp)
     previous_managed_nodes_state=$(mktemp)
 
     if [[ -n "$enable_bbr_token" && "$enable_bbr_token" != "null" ]]; then
@@ -2136,12 +2269,15 @@ sync_once() {
         cp "$CONFIG_FILE" "$previous_v2node_config"
         had_previous_v2node_config=1
     fi
+    if decrypt_config_to_file "$previous_v2node_plain_config"; then
+        had_previous_v2node_plain_config=1
+    fi
     if [[ -f "$MANAGED_NODES_STATE_FILE" ]]; then
         cp "$MANAGED_NODES_STATE_FILE" "$previous_managed_nodes_state"
         had_previous_managed_nodes_state=1
     fi
     if ! write_config "$nodes_json"; then
-        rm -f "$previous_v2node_config" "$previous_managed_nodes_state"
+        rm -f "$previous_v2node_config" "$previous_v2node_plain_config" "$previous_managed_nodes_state"
         return 1
     fi
     if [[ -n "$connectivity_test_json" && "$connectivity_test_json" != "null" ]]; then
@@ -2167,8 +2303,10 @@ sync_once() {
                 if [[ "$had_previous_v2node_config" == "1" ]]; then
                     mkdir -p "$(dirname "$CONFIG_FILE")"
                     mv "$previous_v2node_config" "$CONFIG_FILE"
+                elif [[ "$had_previous_v2node_plain_config" == "1" ]]; then
+                    encrypt_config_from_file "$previous_v2node_plain_config" || true
                 else
-                    rm -f "$CONFIG_FILE" "$previous_v2node_config"
+                    rm -f "$CONFIG_FILE" "$previous_v2node_config" "$previous_v2node_plain_config"
                 fi
 
                 if [[ "$had_previous_managed_nodes_state" == "1" ]]; then
@@ -2179,12 +2317,12 @@ sync_once() {
                 fi
                 restart_v2node_service || true
             fi
-            rm -f "$previous_v2node_config" "$previous_managed_nodes_state"
+            rm -f "$previous_v2node_config" "$previous_v2node_plain_config" "$previous_managed_nodes_state"
             return 1
         fi
     fi
 
-    rm -f "$previous_v2node_config" "$previous_managed_nodes_state"
+    rm -f "$previous_v2node_config" "$previous_v2node_plain_config" "$previous_managed_nodes_state"
 
     maybe_auto_update "$auto_update_json" || true
 
