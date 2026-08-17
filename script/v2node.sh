@@ -160,6 +160,42 @@ config() {
     esac
 }
 
+unregister_machine_probe() {
+    local probe_script="/usr/local/v2node/v2node-probe.sh"
+
+    if [[ ! -x "$probe_script" ]]; then
+        return 0
+    fi
+
+    if [[ -f /etc/.buncloud-agent/probe-state.json ]]; then
+        "$probe_script" unregister >/dev/null 2>&1 && return 0
+    elif [[ -f /etc/v2node/probe.env ]]; then
+        V2NODE_PROBE_STATE_FILE=/etc/v2node/probe.env \
+            "$probe_script" unregister >/dev/null 2>&1 && return 0
+    else
+        return 0
+    fi
+
+    echo -e "${yellow}面板注销探针失败，继续执行本地卸载；后台记录可稍后手动删除${plain}"
+}
+
+remove_gost() {
+    if [[ x"${release}" == x"alpine" ]]; then
+        service gost stop >/dev/null 2>&1 || true
+        rc-update del gost default >/dev/null 2>&1 || true
+        rm -f /etc/init.d/gost
+    else
+        systemctl stop gost >/dev/null 2>&1 || true
+        systemctl disable gost >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/gost.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    pkill -x gost >/dev/null 2>&1 || true
+    rm -f /etc/gost/config.json /etc/gost/config.json.last-good /usr/bin/gost
+    rmdir /etc/gost >/dev/null 2>&1 || true
+}
+
 uninstall() {
     confirm "确定要卸载 v2node 吗?" "n"
     if [[ $? != 0 ]]; then
@@ -168,6 +204,9 @@ uninstall() {
         fi
         return 0
     fi
+    unregister_machine_probe
+    remove_gost
+
     if [[ x"${release}" == x"alpine" ]]; then
         service v2node-probe stop >/dev/null 2>&1 || true
         rc-update del v2node-probe default >/dev/null 2>&1 || true

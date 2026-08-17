@@ -10,6 +10,171 @@ REPO_SLUG="YeJianbo/v2node"
 UPSTREAM_REPO_SLUG="wyx2685/v2node"
 SCRIPT_BRANCH="main"
 SCRIPT_BASE_URL="https://raw.githubusercontent.com/${REPO_SLUG}/${SCRIPT_BRANCH}/script"
+AGENT_BIN="/usr/local/v2node/v2node"
+CONFIG_DIR="/etc/.buncloud-agent"
+LEGACY_CONFIG_DIR="/etc/v2node"
+CONFIG_FILE="${V2NODE_CONFIG_FILE:-${CONFIG_DIR}/config.enc.json}"
+PLAIN_CONFIG_FILE="${V2NODE_CONFIG_PLAIN_FILE:-${CONFIG_DIR}/config.json}"
+CONFIG_KEY_FILE="${V2NODE_CONFIG_KEY_FILE:-${CONFIG_DIR}/config.key}"
+PROBE_STATE_FILE="${V2NODE_PROBE_STATE_FILE:-${CONFIG_DIR}/probe-state.json}"
+RUNTIME_ENV_FILE="${V2NODE_RUNTIME_ENV_FILE:-${CONFIG_DIR}/runtime.env}"
+CONFIG_ENCRYPTION_ENABLED=1
+
+ensure_private_dir() {
+    local dir="$1"
+    mkdir -p "$dir" >/dev/null 2>&1
+    chmod 700 "$dir" >/dev/null 2>&1 || true
+}
+
+ensure_config_key() {
+    ensure_private_dir "$CONFIG_DIR"
+    if [[ "${CONFIG_ENCRYPTION_ENABLED:-1}" != "1" ]]; then
+        printf ''
+        return 0
+    fi
+    if [[ -s "$CONFIG_KEY_FILE" ]]; then
+        tr -d '\r\n' < "$CONFIG_KEY_FILE"
+        return 0
+    fi
+
+    local key
+    if ! key=$("$AGENT_BIN" config keygen 2>/dev/null); then
+        return 1
+    fi
+    printf '%s' "$key" > "$CONFIG_KEY_FILE"
+    chmod 600 "$CONFIG_KEY_FILE" >/dev/null 2>&1 || true
+    printf '%s' "$key"
+}
+
+decrypt_config_to_file() {
+    local output_file="$1"
+    local key="$2"
+
+    if [[ "${CONFIG_ENCRYPTION_ENABLED:-1}" != "1" ]]; then
+        if [[ -f "$CONFIG_FILE" ]]; then
+            cp "$CONFIG_FILE" "$output_file"
+            return 0
+        fi
+        return 1
+    fi
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        "$AGENT_BIN" config decrypt --in "$CONFIG_FILE" --out "$output_file" --key "$key" >/dev/null 2>&1
+        return $?
+    fi
+
+    if [[ -f "$PLAIN_CONFIG_FILE" ]]; then
+        cp "$PLAIN_CONFIG_FILE" "$output_file"
+        return 0
+    fi
+
+    if [[ -f "${LEGACY_CONFIG_DIR}/config.json" ]]; then
+        cp "${LEGACY_CONFIG_DIR}/config.json" "$output_file"
+        return 0
+    fi
+
+    return 1
+}
+
+encrypt_config_from_file() {
+    local input_file="$1"
+    local key="$2"
+
+    ensure_private_dir "$CONFIG_DIR"
+    if [[ "${CONFIG_ENCRYPTION_ENABLED:-1}" != "1" ]]; then
+        cp "$input_file" "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    if ! "$AGENT_BIN" config encrypt --in "$input_file" --out "$CONFIG_FILE" --key "$key" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    chmod 600 "$CONFIG_FILE" >/dev/null 2>&1 || true
+    rm -f "$PLAIN_CONFIG_FILE" "${LEGACY_CONFIG_DIR}/config.json"
+    return 0
+}
+
+seed_plain_config_file() {
+    local output_file="$1"
+    cat > "$output_file" <<EOF
+{
+    "Log": {
+        "Level": "warning",
+        "Output": "",
+        "Access": "none"
+    },
+    "Nodes": []
+}
+EOF
+}
+
+has_existing_config() {
+    [[ -f "$CONFIG_FILE" || -f "$PLAIN_CONFIG_FILE" || -f "${LEGACY_CONFIG_DIR}/config.json" ]]
+}
+
+migrate_existing_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        return 0
+    fi
+
+    local source_file=""
+    local config_key
+
+    if [[ -f "$PLAIN_CONFIG_FILE" ]]; then
+        source_file="$PLAIN_CONFIG_FILE"
+    elif [[ -f "${LEGACY_CONFIG_DIR}/config.json" ]]; then
+        source_file="${LEGACY_CONFIG_DIR}/config.json"
+    else
+        return 0
+    fi
+
+    if ! config_key=$(ensure_config_key); then
+        echo -e "${red}读取配置加密密钥失败，已停止启动以保护现有节点配置${plain}"
+        return 1
+    fi
+
+    if ! encrypt_config_from_file "$source_file" "$config_key"; then
+        echo -e "${red}迁移旧节点配置失败，已停止启动以保护现有节点配置${plain}"
+        return 1
+    fi
+
+    echo -e "${green}已将旧节点配置迁移到 ${CONFIG_FILE}${plain}"
+}
+
+refresh_runtime_env_file() {
+    local key
+
+    ensure_private_dir "$CONFIG_DIR"
+    if [[ "${CONFIG_ENCRYPTION_ENABLED:-1}" != "1" ]]; then
+        cat > "$RUNTIME_ENV_FILE" <<EOF
+export BUNCLOUD_CONFIG_PATH='$(escape_env_value "$CONFIG_FILE")'
+export V2NODE_CONFIG_PATH='$(escape_env_value "$CONFIG_FILE")'
+export V2NODE_CONFIG_FILE='$(escape_env_value "$CONFIG_FILE")'
+export V2NODE_PROBE_STATE_FILE='$(escape_env_value "$PROBE_STATE_FILE")'
+export V2NODE_CONFIG_PLAIN='true'
+EOF
+        chmod 600 "$RUNTIME_ENV_FILE" >/dev/null 2>&1 || true
+        return 0
+    fi
+    if [[ ! -s "$CONFIG_KEY_FILE" ]]; then
+        return 1
+    fi
+
+    key=$(tr -d '\r\n' < "$CONFIG_KEY_FILE")
+    cat > "$RUNTIME_ENV_FILE" <<EOF
+export BUNCLOUD_CONFIG_PATH='$(escape_env_value "$CONFIG_FILE")'
+export V2NODE_CONFIG_PATH='$(escape_env_value "$CONFIG_FILE")'
+export BUNCLOUD_CONFIG_KEY='$(escape_env_value "$key")'
+export V2NODE_CONFIG_KEY='$(escape_env_value "$key")'
+export V2NODE_CONFIG_FILE='$(escape_env_value "$CONFIG_FILE")'
+export V2NODE_CONFIG_KEY_FILE='$(escape_env_value "$CONFIG_KEY_FILE")'
+export V2NODE_PROBE_STATE_FILE='$(escape_env_value "$PROBE_STATE_FILE")'
+export V2NODE_CONFIG_PLAIN='$(if [[ "${CONFIG_ENCRYPTION_ENABLED:-1}" == "1" ]]; then printf false; else printf true; fi)'
+EOF
+    chmod 600 "$RUNTIME_ENV_FILE" >/dev/null 2>&1 || true
+}
 
 # check root
 [[ $EUID -ne 0 ]] && echo -e "${red}错误：${plain} 必须使用root用户运行此脚本！\n" && exit 1
@@ -244,26 +409,31 @@ generate_v2node_config() {
         local api_host="$1"
         local node_id="$2"
         local api_key="$3"
-        local config_file="/etc/v2node/config.json"
+        local config_file="$CONFIG_FILE"
         local action="生成"
+        local plain_config_file
+        local config_key
 
         if ! [[ "$node_id" =~ ^[0-9]+$ ]]; then
             echo -e "${red}节点ID必须为整数${plain}"
             return 1
         fi
 
-        mkdir -p /etc/v2node >/dev/null 2>&1
-        if [[ -f "$config_file" ]]; then
-            local tmp_file
-            tmp_file=$(mktemp)
+        if ! config_key=$(ensure_config_key); then
+            echo -e "${red}生成配置加密密钥失败${plain}"
+            return 1
+        fi
+
+        plain_config_file=$(mktemp)
+        if decrypt_config_to_file "$plain_config_file" "$config_key"; then
             if ! command -v jq >/dev/null 2>&1; then
                 echo -e "${red}当前系统缺少 jq，无法追加节点，请先执行 v2node update 或手动安装 jq${plain}"
-                rm -f "$tmp_file"
+                rm -f "$plain_config_file"
                 return 1
             fi
-            if ! jq empty "$config_file" >/dev/null 2>&1; then
+            if ! jq empty "$plain_config_file" >/dev/null 2>&1; then
                 echo -e "${red}现有配置文件不是合法 JSON，已停止追加节点，请先检查 ${config_file}${plain}"
-                rm -f "$tmp_file"
+                rm -f "$plain_config_file"
                 return 1
             fi
             if ! jq \
@@ -286,15 +456,15 @@ generate_v2node_config() {
                     + [$newNode]
                 )
                 ' \
-                "$config_file" > "$tmp_file"; then
+                "$plain_config_file" > "${plain_config_file}.next"; then
                 echo -e "${red}追加节点到配置文件失败${plain}"
-                rm -f "$tmp_file"
+                rm -f "$plain_config_file" "${plain_config_file}.next"
                 return 1
             fi
-            mv "$tmp_file" "$config_file"
+            mv "${plain_config_file}.next" "$plain_config_file"
             action="追加"
         else
-        cat > "$config_file" <<EOF
+            cat > "$plain_config_file" <<EOF
 {
     "Log": {
         "Level": "warning",
@@ -312,6 +482,13 @@ generate_v2node_config() {
 }
 EOF
         fi
+
+        if ! encrypt_config_from_file "$plain_config_file" "$config_key"; then
+            echo -e "${red}写入加密配置失败${plain}"
+            rm -f "$plain_config_file"
+            return 1
+        fi
+        rm -f "$plain_config_file"
         echo -e "${green}V2node 配置文件${action}完成,正在重新启动服务${plain}"
         if [[ x"${release}" == x"alpine" ]]; then
             service v2node restart
@@ -388,9 +565,37 @@ install_v2node() {
     unzip v2node-linux.zip
     rm v2node-linux.zip -f
     chmod +x v2node
+    if ! "$AGENT_BIN" config keygen >/dev/null 2>&1; then
+        CONFIG_ENCRYPTION_ENABLED=0
+        CONFIG_FILE="${V2NODE_PLAIN_CONFIG_FILE:-${LEGACY_CONFIG_DIR}/config.json}"
+        PLAIN_CONFIG_FILE="$CONFIG_FILE"
+        CONFIG_KEY_FILE="${LEGACY_CONFIG_DIR}/config.key"
+        echo -e "${yellow}当前 v2node 二进制不支持加密配置，回退到兼容明文配置模式${plain}"
+    fi
     mkdir /etc/v2node/ -p
     cp geoip.dat /etc/v2node/
     cp geosite.dat /etc/v2node/
+    ensure_private_dir "$CONFIG_DIR"
+    if ! ensure_config_key >/dev/null; then
+        echo -e "${red}初始化配置加密密钥失败${plain}"
+        exit 1
+    fi
+    if ! refresh_runtime_env_file; then
+        echo -e "${red}写入运行时环境失败${plain}"
+        exit 1
+    fi
+    if ! migrate_existing_config; then
+        exit 1
+    fi
+    cat > /usr/local/v2node/run.sh <<EOF
+#!/bin/sh
+set -eu
+if [ -f "${RUNTIME_ENV_FILE}" ]; then
+  . "${RUNTIME_ENV_FILE}"
+fi
+exec /usr/local/v2node/v2node server -c "\${BUNCLOUD_CONFIG_PATH:-${CONFIG_FILE}}" "\$@"
+EOF
+    chmod +x /usr/local/v2node/run.sh
     if ! curl -fsSL "${SCRIPT_BASE_URL}/v2node-probe.sh" -o /usr/local/v2node/v2node-probe.sh; then
         echo -e "${red}下载探针同步脚本失败${plain}"
         exit 1
@@ -404,8 +609,8 @@ install_v2node() {
 name="v2node"
 description="v2node"
 
-command="/usr/local/v2node/v2node"
-command_args="server"
+command="/usr/local/v2node/run.sh"
+command_args=""
 command_user="root"
 
 pidfile="/run/v2node.pid"
@@ -435,7 +640,7 @@ LimitRSS=infinity
 LimitCORE=infinity
 LimitNOFILE=999999
 WorkingDirectory=/usr/local/v2node/
-ExecStart=/usr/local/v2node/v2node server
+ExecStart=/usr/local/v2node/run.sh
 Restart=always
 RestartSec=10
 
@@ -453,14 +658,24 @@ EOF
     if [[ "$INSTALL_MODE_ARG" == "machine" ]]; then
         setup_machine_probe
         first_install=false
-    elif [[ ! -f /etc/v2node/config.json ]]; then
+    elif ! has_existing_config; then
         # 如果通过 CLI 传入了完整参数，则直接生成配置并跳过交互
         if [[ -n "$API_HOST_ARG" && -n "$NODE_ID_ARG" && -n "$API_KEY_ARG" ]]; then
             generate_v2node_config "$API_HOST_ARG" "$NODE_ID_ARG" "$API_KEY_ARG"
-            echo -e "${green}已根据参数生成 /etc/v2node/config.json${plain}"
+            echo -e "${green}已根据参数生成加密配置 ${CONFIG_FILE}${plain}"
             first_install=false
         else
-            cp config.json /etc/v2node/
+            local plain_config_file
+            local config_key
+            config_key=$(ensure_config_key)
+            plain_config_file=$(mktemp)
+            seed_plain_config_file "$plain_config_file"
+            if ! encrypt_config_from_file "$plain_config_file" "$config_key"; then
+                rm -f "$plain_config_file"
+                echo -e "${red}初始化加密配置失败${plain}"
+                exit 1
+            fi
+            rm -f "$plain_config_file"
             first_install=true
         fi
     else
@@ -468,7 +683,7 @@ EOF
             if ! generate_v2node_config "$API_HOST_ARG" "$NODE_ID_ARG" "$API_KEY_ARG"; then
                 exit 1
             fi
-            echo -e "${green}检测到现有安装，已向 /etc/v2node/config.json 追加一个节点${plain}"
+            echo -e "${green}检测到现有安装，已向加密配置追加一个节点${plain}"
         else
             if [[ x"${release}" == x"alpine" ]]; then
                 service v2node start
@@ -516,7 +731,7 @@ EOF
     if [[ "$INSTALL_MODE_ARG" == "machine" ]]; then
         echo -e "${green}已启用探针模式。后续在面板为该在线服务器分配 v2node 节点后，会自动同步到本机。${plain}"
     elif [[ $first_install == true ]]; then
-        read -rp "检测到你为第一次安装 v2node，是否自动生成 /etc/v2node/config.json？(y/n): " if_generate
+        read -rp "检测到你为第一次安装 v2node，是否自动生成加密配置 ${CONFIG_FILE}？(y/n): " if_generate
         if [[ "$if_generate" =~ ^[Yy]$ ]]; then
             # 交互式收集参数，提供示例默认值
             read -rp "面板API地址[格式: https://example.com/]: " api_host
@@ -534,7 +749,7 @@ EOF
 }
 
 disable_machine_probe() {
-    rm -f /etc/v2node/probe.env
+    rm -f "$PROBE_STATE_FILE" "${LEGACY_CONFIG_DIR}/probe.env"
     if [[ x"${release}" == x"alpine" ]]; then
         if [[ -f /etc/init.d/v2node-probe ]]; then
             service v2node-probe stop >/dev/null 2>&1 || true
@@ -649,34 +864,39 @@ setup_machine_probe() {
     fi
 
     local panel_url="${PANEL_URL_ARG%/}"
-    local escaped_panel_url
-    local escaped_machine_token
-    escaped_panel_url=$(escape_env_value "$panel_url")
-    escaped_machine_token=$(escape_env_value "$MACHINE_TOKEN_ARG")
-
-    mkdir -p /etc/v2node
-    if [[ -f /etc/v2node/config.json ]]; then
-        echo -e "${yellow}检测到已有 /etc/v2node/config.json，探针安装将保留旧配置；后续只合并面板下发节点${plain}"
+    ensure_private_dir "$CONFIG_DIR"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo -e "${yellow}检测到已有加密配置，探针安装将保留旧配置；后续只合并面板下发节点${plain}"
     else
-        cat > /etc/v2node/config.json <<EOF
-{
-    "Log": {
-        "Level": "warning",
-        "Output": "",
-        "Access": "none"
-    },
-    "Nodes": []
-}
-EOF
+        local config_key
+        local plain_config_file
+        if ! config_key=$(ensure_config_key); then
+            echo -e "${red}生成配置加密密钥失败${plain}"
+            exit 1
+        fi
+        plain_config_file=$(mktemp)
+        seed_plain_config_file "$plain_config_file"
+        if ! encrypt_config_from_file "$plain_config_file" "$config_key"; then
+            rm -f "$plain_config_file"
+            echo -e "${red}初始化加密配置失败${plain}"
+            exit 1
+        fi
+        rm -f "$plain_config_file"
     fi
+    refresh_runtime_env_file || true
 
-    cat > /etc/v2node/probe.env <<EOF
-PANEL_URL='${escaped_panel_url}'
-MACHINE_TOKEN='${escaped_machine_token}'
-MACHINE_ID='${MACHINE_ID_ARG}'
-SYNC_INTERVAL='30'
-STATUS_INTERVAL='5'
-EOF
+    jq -n \
+        --arg panel_url "$panel_url" \
+        --arg machine_token "$MACHINE_TOKEN_ARG" \
+        --argjson machine_id "$MACHINE_ID_ARG" \
+        '{
+            panel_url: $panel_url,
+            machine_token: $machine_token,
+            machine_id: $machine_id,
+            sync_interval: 30,
+            status_interval: 5
+        }' > "$PROBE_STATE_FILE"
+    chmod 600 "$PROBE_STATE_FILE" >/dev/null 2>&1 || true
 
     if [[ x"${release}" == x"alpine" ]]; then
         cat <<EOF > /etc/init.d/v2node-probe
@@ -725,10 +945,6 @@ EOF
     fi
 
     /usr/local/v2node/v2node-probe.sh sync >/dev/null 2>&1 || true
-
-    if [[ -n "$backup_file" ]]; then
-        echo -e "${yellow}已将原有手工配置备份到: ${backup_file}${plain}"
-    fi
 }
 
 parse_args "$@"

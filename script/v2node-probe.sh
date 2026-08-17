@@ -65,6 +65,10 @@ decrypt_config_to_file() {
     local key
 
     if [[ -f "$CONFIG_FILE" ]]; then
+        if [[ "${V2NODE_CONFIG_PLAIN:-false}" == "true" ]] || ! jq -e '.version == "buncloud-config-v1" and .ciphertext and .nonce' "$CONFIG_FILE" >/dev/null 2>&1; then
+            cp "$CONFIG_FILE" "$output_file"
+            return 0
+        fi
         key=$(read_config_key) || return 1
         /usr/local/v2node/v2node config decrypt --in "$CONFIG_FILE" --out "$output_file" --key "$key" >/dev/null 2>&1
         return $?
@@ -87,8 +91,13 @@ encrypt_config_from_file() {
     local input_file="$1"
     local key
 
-    key=$(read_config_key) || return 1
     ensure_private_dir "$CONFIG_DIR"
+    if [[ "${V2NODE_CONFIG_PLAIN:-false}" == "true" ]]; then
+        cp "$input_file" "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE" >/dev/null 2>&1 || true
+        return 0
+    fi
+    key=$(read_config_key) || return 1
     /usr/local/v2node/v2node config encrypt --in "$input_file" --out "$CONFIG_FILE" --key "$key" >/dev/null 2>&1 || return 1
     chmod 600 "$CONFIG_FILE" >/dev/null 2>&1 || true
     rm -f "${CONFIG_DIR}/config.json" "${LEGACY_CONFIG_DIR}/config.json"
@@ -1063,6 +1072,24 @@ signed_post_json() {
 
     rm -f "$curl_error_file"
     printf '%s' "$output"
+}
+
+unregister_machine() {
+    load_state || return 1
+    ensure_dependencies || return 1
+
+    local response
+    if ! response=$(signed_post_json "/api/v1/server/machine/unregister" "{}"); then
+        fail "通知面板注销探针失败"
+        return 1
+    fi
+
+    if ! printf '%s' "$response" | jq -e '.data == "success" or .data == true' >/dev/null 2>&1; then
+        fail "面板未确认探针注销: ${response}"
+        return 1
+    fi
+
+    log "已从面板注销机器 ${MACHINE_ID}"
 }
 
 cloudflare_api() {
@@ -2227,12 +2254,16 @@ sync_once() {
 
     local nodes_json
     if ! nodes_json=$(printf '%s' "$response" | jq -c '
-        (.data // []) | map({
+        if (.data | type) != "array" then
+            error("面板节点配置响应缺少 data 数组")
+        else
+            .data | map({
             ApiHost: (.ApiHost // .api_host // ""),
             NodeID: ((.NodeID // .node_id // 0) | tonumber),
             ApiKey: (.ApiKey // .api_key // ""),
             Timeout: ((.Timeout // .timeout // 15) | tonumber)
         })
+        end
     '); then
         fail "解析探针配置失败"
         return 1
@@ -2353,6 +2384,9 @@ daemon_loop() {
 }
 
 case "${1:-sync}" in
+    unregister)
+        unregister_machine
+        ;;
     sync)
         sync_once
         ;;
