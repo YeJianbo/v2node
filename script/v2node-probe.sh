@@ -17,6 +17,7 @@ CONFIG_KEY_FILE="${V2NODE_CONFIG_KEY_FILE:-${CONFIG_DIR}/config.key}"
 MANAGED_NODES_STATE_FILE="${V2NODE_PROBE_MANAGED_NODES_STATE_FILE:-${CONFIG_DIR}/probe-managed-nodes.json}"
 DDNS_STATE_FILE="${V2NODE_PROBE_DDNS_STATE_FILE:-${CONFIG_DIR}/probe-ddns.json}"
 UPDATE_STATE_FILE="${V2NODE_PROBE_UPDATE_STATE_FILE:-${CONFIG_DIR}/probe-update.json}"
+DAEMON_LOCK_DIR="${V2NODE_PROBE_LOCK_DIR:-/run/v2node-probe.lock}"
 GOST_CONFIG_FILE="${V2NODE_PROBE_GOST_CONFIG_FILE:-/etc/gost/config.json}"
 GOST_CONFIG_BACKUP_FILE="${V2NODE_PROBE_GOST_CONFIG_BACKUP_FILE:-/etc/gost/config.json.last-good}"
 GOST_BIN="${V2NODE_PROBE_GOST_BIN:-/usr/bin/gost}"
@@ -976,7 +977,7 @@ restart_probe_service() {
     fi
 
     if command -v rc-service >/dev/null 2>&1; then
-        rc-service v2node-probe restart >/dev/null 2>&1 || true
+        nohup sh -c 'sleep 2; rc-service v2node-probe restart >/dev/null 2>&1 || rc-service v2node-probe start >/dev/null 2>&1' </dev/null >/dev/null 2>&1 &
         exit 0
     fi
 
@@ -1970,8 +1971,19 @@ restart_v2node_service() {
         return $?
     fi
 
-    if command -v service >/dev/null 2>&1 && timeout 3 service v2node status >/dev/null 2>&1; then
-        service v2node restart
+    if command -v rc-service >/dev/null 2>&1 && [[ -x /etc/init.d/v2node ]]; then
+        if rc-service v2node restart >/dev/null 2>&1; then
+            return 0
+        fi
+
+        local openrc_pids
+        openrc_pids=$(ps -eo pid=,args= | awk '/\/usr\/local\/v2node\/v2node server/ && !/awk/ {print $1}')
+        if [[ -n "$openrc_pids" ]]; then
+            kill $openrc_pids 2>/dev/null || true
+            sleep 1
+        fi
+        rm -f /run/v2node.pid
+        rc-service v2node start
         return $?
     fi
 
@@ -2366,7 +2378,19 @@ daemon_loop() {
     local last_sync_at=0
     local now
 
-    trap 'exit 0' TERM INT
+    if ! mkdir "$DAEMON_LOCK_DIR" 2>/dev/null; then
+        local existing_pid=""
+        existing_pid=$(cat "${DAEMON_LOCK_DIR}/pid" 2>/dev/null || true)
+        if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" >/dev/null 2>&1; then
+            fail "探针 daemon 已运行，PID ${existing_pid}"
+            return 0
+        fi
+        rm -rf "$DAEMON_LOCK_DIR"
+        mkdir "$DAEMON_LOCK_DIR" || return 1
+    fi
+    printf '%s' "$$" > "${DAEMON_LOCK_DIR}/pid"
+
+    trap 'rm -rf "$DAEMON_LOCK_DIR"; exit 0' TERM INT EXIT
 
     while true; do
         load_state || true

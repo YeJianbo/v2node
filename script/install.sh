@@ -513,20 +513,55 @@ get_latest_release_tag() {
 download_release_zip() {
     local repo_slug="$1"
     local version="$2"
+    local output_file="$3"
     local url="https://github.com/${repo_slug}/releases/download/${version}/v2node-linux-${arch}.zip"
 
-    curl -fLsS "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
+    curl -fLsS "$url" | pv -s 30M -W -N "下载进度" > "$output_file"
+}
+
+download_release_zip_with_retry() {
+    local repo_slug="$1"
+    local version="$2"
+    local output_file="$3"
+    local attempt
+
+    for attempt in 1 2 3 4 5 6; do
+        if download_release_zip "$repo_slug" "$version" "$output_file"; then
+            return 0
+        fi
+        rm -f "$output_file"
+        if [[ "$attempt" -lt 6 ]]; then
+            echo -e "${yellow}Release 已创建但当前架构产物尚未就绪，10 秒后重试 (${attempt}/6)${plain}"
+            sleep 10
+        fi
+    done
+
+    return 1
+}
+
+stop_existing_v2node_processes() {
+    if [[ x"${release}" == x"alpine" ]]; then
+        service v2node-probe stop >/dev/null 2>&1 || true
+        service v2node stop >/dev/null 2>&1 || true
+        pkill -f '/usr/local/v2node/v2node-probe.sh daemon' >/dev/null 2>&1 || true
+        pkill -f '/usr/local/v2node/v2node server' >/dev/null 2>&1 || true
+        rm -f /run/v2node.pid /run/v2node-probe.pid
+        rm -rf /run/v2node-probe.lock
+        return
+    fi
+
+    systemctl stop v2node-probe >/dev/null 2>&1 || true
+    systemctl stop v2node >/dev/null 2>&1 || true
 }
 
 install_v2node() {
     local version_param="$1"
     local release_repo="$REPO_SLUG"
-    if [[ -e /usr/local/v2node/ ]]; then
-        rm -rf /usr/local/v2node/
-    fi
-
-    mkdir /usr/local/v2node/ -p
-    cd /usr/local/v2node/
+    local install_stage
+    local release_zip
+    install_stage=$(mktemp -d)
+    release_zip="${install_stage}/v2node-linux.zip"
+    cd "$install_stage"
 
     if  [[ -z "$version_param" ]] ; then
         last_version=$(get_latest_release_tag "$release_repo")
@@ -540,31 +575,34 @@ install_v2node() {
             exit 1
         fi
         echo -e "${green}检测到最新版本：${last_version}，开始安装...${plain}"
-        if ! download_release_zip "$release_repo" "$last_version"; then
-            if [[ "$release_repo" != "$UPSTREAM_REPO_SLUG" ]]; then
-                echo -e "${yellow}从你的 fork 下载 release 失败，回退到上游 release 源${plain}"
-                release_repo="$UPSTREAM_REPO_SLUG"
-            fi
-            if ! download_release_zip "$release_repo" "$last_version"; then
-                echo -e "${red}下载 v2node 失败，请确保你的服务器能够下载 Github 的文件${plain}"
-                exit 1
-            fi
+        if ! download_release_zip_with_retry "$release_repo" "$last_version" "$release_zip"; then
+            rm -rf "$install_stage"
+            echo -e "${red}下载 v2node ${last_version} 失败；该版本产物可能仍在构建，请稍后重试${plain}"
+            exit 1
         fi
     else
         last_version=$version_param
-        if ! download_release_zip "$release_repo" "$last_version"; then
-            echo -e "${yellow}你的 fork 中不存在版本 ${last_version}，回退到上游 release 源${plain}"
-            release_repo="$UPSTREAM_REPO_SLUG"
-            if ! download_release_zip "$release_repo" "$last_version"; then
-                echo -e "${red}下载 v2node $1 失败，请确保此版本存在${plain}"
-                exit 1
-            fi
+        if ! download_release_zip_with_retry "$release_repo" "$last_version" "$release_zip"; then
+            rm -rf "$install_stage"
+            echo -e "${red}下载 v2node $1 失败，请确认 fork 中存在该版本及当前架构产物${plain}"
+            exit 1
         fi
     fi
 
-    unzip v2node-linux.zip
-    rm v2node-linux.zip -f
+    unzip "$release_zip"
+    rm "$release_zip" -f
+    if [[ ! -f v2node || ! -f geoip.dat || ! -f geosite.dat ]]; then
+        rm -rf "$install_stage"
+        echo -e "${red}Release 产物不完整，保留现有服务不变${plain}"
+        exit 1
+    fi
     chmod +x v2node
+    stop_existing_v2node_processes
+    rm -rf /usr/local/v2node/
+    mkdir -p /usr/local/v2node/
+    cp -a "${install_stage}/." /usr/local/v2node/
+    rm -rf "$install_stage"
+    cd /usr/local/v2node/
     local config_key_probe=""
     config_key_probe=$("$AGENT_BIN" config keygen 2>/dev/null || true)
     if ! [[ "$config_key_probe" =~ ^[A-Za-z0-9+/_=-]{20,}$ ]]; then
@@ -617,6 +655,16 @@ command_user="root"
 
 pidfile="/run/v2node.pid"
 command_background="yes"
+
+start_pre() {
+        if [ -f "\$pidfile" ] && ! kill -0 "\$(cat "\$pidfile" 2>/dev/null)" 2>/dev/null; then
+                rm -f "\$pidfile"
+        fi
+}
+
+stop_post() {
+        rm -f "\$pidfile"
+}
 
 depend() {
         need net
@@ -913,14 +961,25 @@ command_user="root"
 pidfile="/run/v2node-probe.pid"
 command_background="yes"
 
+start_pre() {
+    if [ -f "\$pidfile" ] && ! kill -0 "\$(cat "\$pidfile" 2>/dev/null)" 2>/dev/null; then
+        rm -f "\$pidfile"
+    fi
+}
+
+stop_post() {
+    rm -f "\$pidfile"
+}
+
 depend() {
     need net
 }
 EOF
         chmod +x /etc/init.d/v2node-probe
         rc-update add v2node-probe default >/dev/null 2>&1 || true
-        service v2node-probe restart >/dev/null 2>&1 || service v2node-probe start >/dev/null 2>&1
-        service v2node start >/dev/null 2>&1 || true
+        rm -f /run/v2node.pid /run/v2node-probe.pid
+        service v2node start >/dev/null 2>&1 || service v2node restart >/dev/null 2>&1
+        service v2node-probe start >/dev/null 2>&1 || service v2node-probe restart >/dev/null 2>&1
     else
         cat <<EOF > /etc/systemd/system/v2node-probe.service
 [Unit]
