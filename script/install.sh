@@ -565,7 +565,9 @@ install_v2node() {
     unzip v2node-linux.zip
     rm v2node-linux.zip -f
     chmod +x v2node
-    if ! "$AGENT_BIN" config keygen >/dev/null 2>&1; then
+    local config_key_probe=""
+    config_key_probe=$("$AGENT_BIN" config keygen 2>/dev/null || true)
+    if ! [[ "$config_key_probe" =~ ^[A-Za-z0-9+/_=-]{20,}$ ]]; then
         CONFIG_ENCRYPTION_ENABLED=0
         CONFIG_FILE="${V2NODE_PLAIN_CONFIG_FILE:-${LEGACY_CONFIG_DIR}/config.json}"
         PLAIN_CONFIG_FILE="$CONFIG_FILE"
