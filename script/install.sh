@@ -801,12 +801,22 @@ EOF
 disable_machine_probe() {
     rm -f "$PROBE_STATE_FILE" "${LEGACY_CONFIG_DIR}/probe.env"
     if [[ x"${release}" == x"alpine" ]]; then
+        if [[ -f /etc/init.d/ravel-probe ]]; then
+            service ravel-probe stop >/dev/null 2>&1 || true
+            rc-update del ravel-probe default >/dev/null 2>&1 || true
+            rm -f /etc/init.d/ravel-probe
+        fi
         if [[ -f /etc/init.d/v2node-probe ]]; then
             service v2node-probe stop >/dev/null 2>&1 || true
             rc-update del v2node-probe default >/dev/null 2>&1 || true
             rm -f /etc/init.d/v2node-probe
         fi
     else
+        if [[ -f /etc/systemd/system/ravel-probe.service ]]; then
+            systemctl stop ravel-probe >/dev/null 2>&1 || true
+            systemctl disable ravel-probe >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/ravel-probe.service
+        fi
         if [[ -f /etc/systemd/system/v2node-probe.service ]]; then
             systemctl stop v2node-probe >/dev/null 2>&1 || true
             systemctl disable v2node-probe >/dev/null 2>&1 || true
@@ -939,26 +949,31 @@ setup_machine_probe() {
         --arg panel_url "$panel_url" \
         --arg machine_token "$MACHINE_TOKEN_ARG" \
         --argjson machine_id "$MACHINE_ID_ARG" \
+        --arg protocol "ravel-v1" \
         '{
             panel_url: $panel_url,
             machine_token: $machine_token,
             machine_id: $machine_id,
+            protocol: $protocol,
             sync_interval: 30,
             status_interval: 5
         }' > "$PROBE_STATE_FILE"
     chmod 600 "$PROBE_STATE_FILE" >/dev/null 2>&1 || true
 
+    install -d -m 0755 /usr/local/ravel-probe
+    install -m 0755 /usr/local/v2node/v2node-probe.sh /usr/local/ravel-probe/ravel-probe.sh
+
     if [[ x"${release}" == x"alpine" ]]; then
-        cat <<EOF > /etc/init.d/v2node-probe
+        cat <<EOF > /etc/init.d/ravel-probe
 #!/sbin/openrc-run
 
-name="v2node-probe"
-description="v2node probe sync service"
+name="ravel-probe"
+description="Ravel probe sync service"
 
-command="/usr/local/v2node/v2node-probe.sh"
+command="/usr/local/ravel-probe/ravel-probe.sh"
 command_args="daemon"
 command_user="root"
-pidfile="/run/v2node-probe.pid"
+pidfile="/run/ravel-probe.pid"
 command_background="yes"
 
 start_pre() {
@@ -975,15 +990,17 @@ depend() {
     need net
 }
 EOF
-        chmod +x /etc/init.d/v2node-probe
-        rc-update add v2node-probe default >/dev/null 2>&1 || true
-        rm -f /run/v2node.pid /run/v2node-probe.pid
-        service v2node start >/dev/null 2>&1 || service v2node restart >/dev/null 2>&1
-        service v2node-probe start >/dev/null 2>&1 || service v2node-probe restart >/dev/null 2>&1
+        chmod +x /etc/init.d/ravel-probe
+        rc-update add ravel-probe default >/dev/null 2>&1 || true
+        rm -f /run/v2node.pid /run/ravel-probe.pid /run/v2node-probe.pid
+        service ravel-probe restart >/dev/null 2>&1 || service ravel-probe start >/dev/null 2>&1
+        service v2node-probe stop >/dev/null 2>&1 || true
+        rc-update del v2node-probe default >/dev/null 2>&1 || true
+        service v2node start >/dev/null 2>&1 || true
     else
-        cat <<EOF > /etc/systemd/system/v2node-probe.service
+        cat <<EOF > /etc/systemd/system/ravel-probe.service
 [Unit]
-Description=v2node Probe Sync Service
+Description=Ravel Probe Sync Service
 After=network.target
 Wants=network.target
 
@@ -991,7 +1008,7 @@ Wants=network.target
 Type=simple
 User=root
 Group=root
-ExecStart=/usr/local/v2node/v2node-probe.sh daemon
+ExecStart=/usr/local/ravel-probe/ravel-probe.sh daemon
 Restart=always
 RestartSec=5
 
@@ -1000,12 +1017,13 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable v2node >/dev/null 2>&1 || true
-        systemctl enable v2node-probe >/dev/null 2>&1 || true
+        systemctl enable ravel-probe >/dev/null 2>&1 || true
         systemctl restart v2node >/dev/null 2>&1 || systemctl start v2node >/dev/null 2>&1
-        systemctl restart v2node-probe >/dev/null 2>&1 || systemctl start v2node-probe >/dev/null 2>&1
+        systemctl restart ravel-probe >/dev/null 2>&1 || systemctl start ravel-probe >/dev/null 2>&1
+        systemctl disable --now v2node-probe >/dev/null 2>&1 || true
     fi
 
-    /usr/local/v2node/v2node-probe.sh sync >/dev/null 2>&1 || true
+    /usr/local/ravel-probe/ravel-probe.sh sync >/dev/null 2>&1 || true
 }
 
 parse_args "$@"

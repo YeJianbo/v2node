@@ -136,6 +136,7 @@ load_state() {
         PANEL_URL=$(jq -r '.panel_url // ""' "$STATE_FILE")
         MACHINE_TOKEN=$(jq -r '.machine_token // ""' "$STATE_FILE")
         MACHINE_ID=$(jq -r '.machine_id // ""' "$STATE_FILE")
+        PROBE_PROTOCOL=$(jq -r '.protocol // "v2node-v1"' "$STATE_FILE")
         SYNC_INTERVAL=$(jq -r '.sync_interval // empty' "$STATE_FILE")
         STATUS_INTERVAL=$(jq -r '.status_interval // empty' "$STATE_FILE")
     else
@@ -144,9 +145,25 @@ load_state() {
         PANEL_URL="${PANEL_URL:-}"
         MACHINE_TOKEN="${MACHINE_TOKEN:-}"
         MACHINE_ID="${MACHINE_ID:-}"
+        PROBE_PROTOCOL="${PROBE_PROTOCOL:-v2node-v1}"
         SYNC_INTERVAL="${SYNC_INTERVAL:-}"
         STATUS_INTERVAL="${STATUS_INTERVAL:-}"
     fi
+
+    case "$PROBE_PROTOCOL" in
+        ravel-v1)
+            PROBE_HEADER_PREFIX="X-Ravel"
+            PROBE_SERVICE_NAME="${PROBE_SERVICE_NAME:-ravel-probe}"
+            ;;
+        v2node-v1)
+            PROBE_HEADER_PREFIX="X-V2Node"
+            PROBE_SERVICE_NAME="${PROBE_SERVICE_NAME:-v2node-probe}"
+            ;;
+        *)
+            fail "不支持的探针协议: $PROBE_PROTOCOL"
+            return 1
+            ;;
+    esac
 
     SYNC_INTERVAL="${SYNC_INTERVAL:-$SYNC_INTERVAL_DEFAULT}"
     if ! [[ "$SYNC_INTERVAL" =~ ^[0-9]+$ ]] || (( SYNC_INTERVAL < SYNC_INTERVAL_DEFAULT )); then
@@ -982,12 +999,12 @@ restart_probe_service() {
     log "探针脚本已更新，准备重启探针服务"
 
     if command -v systemctl >/dev/null 2>&1 && timeout 3 systemctl list-units >/dev/null 2>&1; then
-        systemctl restart v2node-probe >/dev/null 2>&1 || true
+        systemctl restart "$PROBE_SERVICE_NAME" >/dev/null 2>&1 || true
         exit 0
     fi
 
     if command -v rc-service >/dev/null 2>&1; then
-        nohup sh -c 'sleep 2; rc-service v2node-probe restart >/dev/null 2>&1 || rc-service v2node-probe start >/dev/null 2>&1' </dev/null >/dev/null 2>&1 &
+        nohup sh -c 'sleep 2; rc-service "$1" restart >/dev/null 2>&1 || rc-service "$1" start >/dev/null 2>&1' sh "$PROBE_SERVICE_NAME" </dev/null >/dev/null 2>&1 &
         exit 0
     fi
 
@@ -1003,6 +1020,10 @@ hmac_sha256_hex() {
     openssl dgst -sha256 -hmac "$secret" -binary | od -An -tx1 | tr -d ' \n'
 }
 
+new_request_nonce() {
+    openssl rand -hex 16
+}
+
 signed_get() {
     local path="$1"
     local query="${2:-}"
@@ -1014,9 +1035,13 @@ signed_get() {
     local url
 
     timestamp=$(date +%s)
-    nonce="${timestamp}-$$-${RANDOM}-${RANDOM}"
+    nonce=$(new_request_nonce)
     body_hash=$(printf '' | sha256_hex)
-    payload=$(printf 'GET\n%s\n%s\n%s\n%s' "$path" "$timestamp" "$nonce" "$body_hash")
+    if [[ "$PROBE_PROTOCOL" == "ravel-v1" ]]; then
+        payload=$(printf 'GET\n%s\n%s\n%s\n%s\n%s' "$path" "$query" "$timestamp" "$nonce" "$body_hash")
+    else
+        payload=$(printf 'GET\n%s\n%s\n%s\n%s' "$path" "$timestamp" "$nonce" "$body_hash")
+    fi
     signature=$(printf '%s' "$payload" | hmac_sha256_hex "$MACHINE_TOKEN")
     url="${PANEL_URL}${path}"
     if [[ -n "$query" ]]; then
@@ -1028,10 +1053,10 @@ signed_get() {
     local curl_error_file
     curl_error_file=$(mktemp)
     output=$(curl -fsSL --connect-timeout 5 --max-time 8 \
-        -H "X-V2Node-Machine-Id: ${MACHINE_ID}" \
-        -H "X-V2Node-Timestamp: ${timestamp}" \
-        -H "X-V2Node-Nonce: ${nonce}" \
-        -H "X-V2Node-Signature: ${signature}" \
+        -H "${PROBE_HEADER_PREFIX}-Machine-Id: ${MACHINE_ID}" \
+        -H "${PROBE_HEADER_PREFIX}-Timestamp: ${timestamp}" \
+        -H "${PROBE_HEADER_PREFIX}-Nonce: ${nonce}" \
+        -H "${PROBE_HEADER_PREFIX}-Signature: ${signature}" \
         -H "Connection: close" \
         "$url" 2>"$curl_error_file") || curl_status=$?
 
@@ -1055,9 +1080,13 @@ signed_post_json() {
     local signature
 
     timestamp=$(date +%s)
-    nonce="${timestamp}-$$-${RANDOM}-${RANDOM}"
+    nonce=$(new_request_nonce)
     body_hash=$(printf '%s' "$body" | sha256_hex)
-    payload=$(printf 'POST\n%s\n%s\n%s\n%s' "$path" "$timestamp" "$nonce" "$body_hash")
+    if [[ "$PROBE_PROTOCOL" == "ravel-v1" ]]; then
+        payload=$(printf 'POST\n%s\n\n%s\n%s\n%s' "$path" "$timestamp" "$nonce" "$body_hash")
+    else
+        payload=$(printf 'POST\n%s\n%s\n%s\n%s' "$path" "$timestamp" "$nonce" "$body_hash")
+    fi
     signature=$(printf '%s' "$payload" | hmac_sha256_hex "$MACHINE_TOKEN")
 
     local output
@@ -1067,10 +1096,10 @@ signed_post_json() {
     output=$(curl -fsSL --connect-timeout 5 --max-time 8 \
         -X POST \
         -H "Content-Type: application/json" \
-        -H "X-V2Node-Machine-Id: ${MACHINE_ID}" \
-        -H "X-V2Node-Timestamp: ${timestamp}" \
-        -H "X-V2Node-Nonce: ${nonce}" \
-        -H "X-V2Node-Signature: ${signature}" \
+        -H "${PROBE_HEADER_PREFIX}-Machine-Id: ${MACHINE_ID}" \
+        -H "${PROBE_HEADER_PREFIX}-Timestamp: ${timestamp}" \
+        -H "${PROBE_HEADER_PREFIX}-Nonce: ${nonce}" \
+        -H "${PROBE_HEADER_PREFIX}-Signature: ${signature}" \
         -H "Connection: close" \
         --data "$body" \
         "${PANEL_URL}${path}" 2>"$curl_error_file") || curl_status=$?
@@ -1718,7 +1747,7 @@ push_status() {
     listen_ports=$(read_listen_ports)
     listen_processes=$(read_listen_processes)
     uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d'.' -f1)
-    version="v2node-probe $(uname -s 2>/dev/null) $(uname -m 2>/dev/null)"
+    version="ravel-probe $(uname -s 2>/dev/null) $(uname -m 2>/dev/null)"
     v2node_version=$(get_local_v2node_version)
     local_ipv4=$(read_local_ipv4)
     local_ipv6=$(read_local_ipv6)
@@ -2243,7 +2272,7 @@ sync_once() {
     fi
 
     local restart_token
-    restart_token=$(printf '%s' "$response" | jq -r '.restart_v2node_token // ""')
+    restart_token=$(printf '%s' "$response" | jq -r '.restart_node_token // .restart_v2node_token // ""')
     local enable_bbr_token
     enable_bbr_token=$(printf '%s' "$response" | jq -r '.enable_bbr_token // ""')
     local ddns_json
