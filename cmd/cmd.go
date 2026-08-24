@@ -7,8 +7,8 @@ import (
 )
 
 var command = &cobra.Command{
-	Use:     "buncloud-agent",
-	Aliases: []string{"v2node"},
+	Use:     "ravel",
+	Aliases: []string{"buncloud-agent", "v2node"},
 }
 
 func Run() {

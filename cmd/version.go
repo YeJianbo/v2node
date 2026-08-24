@@ -8,8 +8,8 @@ import (
 
 var (
 	version  = "TempVersion" //use ldflags replace
-	codename = "buncloud-agent"
-	intro    = "A BunCloud managed node agent based on modified xray-core"
+	codename = "ravel"
+	intro    = "Ravel integrated node runtime"
 )
 
 var versionCommand = cobra.Command{
