@@ -29,6 +29,11 @@ type ConfigResponse struct {
 	Data               []NodeConfig `json:"data"`
 	RestartToken       string       `json:"restart_node_token"`
 	LegacyRestartToken string       `json:"restart_v2node_token"`
+	Probe              ProbeConfig  `json:"probe"`
+}
+
+type ProbeConfig struct {
+	Relay RelayConfig `json:"relay"`
 }
 
 type Controller struct {
@@ -36,6 +41,7 @@ type Controller struct {
 	ConfigFile  string
 	KeyFile     string
 	ManagedFile string
+	Relay       *RelayManager
 }
 
 func LoadState(path string) (State, error) {
@@ -65,6 +71,9 @@ func (c *Controller) Sync() (bool, int, error) {
 	if err := c.Client.Get(configPath, query, &response); err != nil {
 		return false, 0, err
 	}
+	if c.Relay != nil {
+		_, _ = c.Relay.Sync(response.Probe.Relay)
+	}
 	changed, err := c.writeMergedConfig(response.Data)
 	if err != nil {
 		return false, 0, err
@@ -84,6 +93,11 @@ func (c *Controller) Sync() (bool, int, error) {
 }
 
 func (c *Controller) PushStatus(status map[string]any) error {
+	if c.Relay != nil {
+		for key, value := range c.Relay.Status() {
+			status[key] = value
+		}
+	}
 	var response map[string]any
 	return c.Client.Post(statusPath, status, &response)
 }

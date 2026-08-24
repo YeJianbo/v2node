@@ -208,6 +208,12 @@ uninstall() {
     remove_gost
 
     if [[ x"${release}" == x"alpine" ]]; then
+        service ravel stop >/dev/null 2>&1 || true
+        rc-update del ravel default >/dev/null 2>&1 || true
+        rm /etc/init.d/ravel -f
+        service ravel-probe stop >/dev/null 2>&1 || true
+        rc-update del ravel-probe default >/dev/null 2>&1 || true
+        rm /etc/init.d/ravel-probe -f
         service v2node-probe stop >/dev/null 2>&1 || true
         rc-update del v2node-probe default >/dev/null 2>&1 || true
         rm /etc/init.d/v2node-probe -f
@@ -215,6 +221,12 @@ uninstall() {
         rc-update del v2node
         rm /etc/init.d/v2node -f
     else
+        systemctl stop ravel >/dev/null 2>&1 || true
+        systemctl disable ravel >/dev/null 2>&1 || true
+        rm /etc/systemd/system/ravel.service -f
+        systemctl stop ravel-probe >/dev/null 2>&1 || true
+        systemctl disable ravel-probe >/dev/null 2>&1 || true
+        rm /etc/systemd/system/ravel-probe.service -f
         systemctl stop v2node-probe >/dev/null 2>&1 || true
         systemctl disable v2node-probe >/dev/null 2>&1 || true
         rm /etc/systemd/system/v2node-probe.service -f
@@ -226,10 +238,15 @@ uninstall() {
     fi
     rm /etc/v2node/probe.env -f
     rm /etc/v2node/ -rf
+    rm /etc/.buncloud-agent/ -rf
     rm /usr/local/v2node/ -rf
+    rm /usr/local/ravel/ -rf
+    rm /run/ravel.pid /run/ravel-probe.pid /run/v2node-probe.pid -f
+    rm /run/ravel.lock /run/v2node-probe.lock -rf
+    rm /usr/bin/v2node /usr/bin/ravel -f
 
     echo ""
-    echo -e "卸载成功，如果你想删除此脚本，则退出脚本后运行 ${green}rm /usr/bin/v2node -f${plain} 进行删除"
+    echo -e "${green}Ravel、旧探针、GOST、节点程序及本地状态已卸载完成${plain}"
     echo ""
 
     if [[ $# == 0 ]]; then

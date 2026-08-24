@@ -210,6 +210,7 @@ API_HOST_ARG=""
 NODE_ID_ARG=""
 API_KEY_ARG=""
 INSTALL_MODE_ARG="node"
+INSTALL_MODE_EXPLICIT=0
 PANEL_URL_ARG=""
 MACHINE_TOKEN_ARG=""
 MACHINE_ID_ARG=""
@@ -226,7 +227,7 @@ parse_args() {
             --api-key)
                 API_KEY_ARG="$2"; shift 2 ;;
             --mode)
-                INSTALL_MODE_ARG="$2"; shift 2 ;;
+                INSTALL_MODE_ARG="$2"; INSTALL_MODE_EXPLICIT=1; shift 2 ;;
             --panel)
                 PANEL_URL_ARG="$2"; shift 2 ;;
             --token)
@@ -251,6 +252,36 @@ parse_args() {
                 fi ;;
         esac
     done
+}
+
+restore_existing_machine_mode() {
+    if [[ "$INSTALL_MODE_EXPLICIT" == "1" ]]; then
+        return 0
+    fi
+
+    local state_file=""
+    if [[ -f "${CONFIG_DIR}/state.json" ]]; then
+        state_file="${CONFIG_DIR}/state.json"
+    elif [[ -f "${CONFIG_DIR}/probe-state.json" ]]; then
+        state_file="${CONFIG_DIR}/probe-state.json"
+    fi
+
+    if [[ -n "$state_file" ]] && jq -e 'type == "object"' "$state_file" >/dev/null 2>&1; then
+        PANEL_URL_ARG=$(jq -r '.panel_url // ""' "$state_file")
+        MACHINE_TOKEN_ARG=$(jq -r '.machine_token // ""' "$state_file")
+        MACHINE_ID_ARG=$(jq -r '.machine_id // ""' "$state_file")
+    elif [[ -f "${LEGACY_CONFIG_DIR}/probe.env" ]]; then
+        # shellcheck disable=SC1090
+        source "${LEGACY_CONFIG_DIR}/probe.env"
+        PANEL_URL_ARG="${PANEL_URL:-}"
+        MACHINE_TOKEN_ARG="${MACHINE_TOKEN:-}"
+        MACHINE_ID_ARG="${MACHINE_ID:-}"
+    fi
+
+    if [[ -n "$PANEL_URL_ARG" && -n "$MACHINE_TOKEN_ARG" && "$MACHINE_ID_ARG" =~ ^[0-9]+$ ]] && (( MACHINE_ID_ARG > 0 )); then
+        INSTALL_MODE_ARG="machine"
+        echo -e "${green}检测到现有机器接入配置，本次升级将自动迁移到原生 Ravel${plain}"
+    fi
 }
 
 arch=$(uname -m)
@@ -543,6 +574,7 @@ stop_existing_v2node_processes() {
     if [[ x"${release}" == x"alpine" ]]; then
         service v2node-probe stop >/dev/null 2>&1 || true
         service v2node stop >/dev/null 2>&1 || true
+		service ravel stop >/dev/null 2>&1 || true
         pkill -f '/usr/local/v2node/v2node-probe.sh daemon' >/dev/null 2>&1 || true
         pkill -f '/usr/local/v2node/v2node server' >/dev/null 2>&1 || true
         rm -f /run/v2node.pid /run/v2node-probe.pid
@@ -552,6 +584,7 @@ stop_existing_v2node_processes() {
 
     systemctl stop v2node-probe >/dev/null 2>&1 || true
     systemctl stop v2node >/dev/null 2>&1 || true
+    systemctl stop ravel >/dev/null 2>&1 || true
 }
 
 install_v2node() {
@@ -1034,6 +1067,7 @@ EOF
 }
 
 parse_args "$@"
+restore_existing_machine_mode
 echo -e "${green}开始安装${plain}"
 install_base
 install_v2node "$VERSION_ARG"

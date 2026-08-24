@@ -44,6 +44,7 @@ func ravelHandle(_ *cobra.Command, _ []string) {
 		ConfigFile:  ravelConfigFile,
 		KeyFile:     ravelKeyFile,
 		ManagedFile: ravelManagedFile,
+		Relay:       agent.NewRelayManager("/usr/local/ravel/gost", "/etc/.buncloud-agent/relay.json"),
 	}
 	changed, nodeCount, err := controller.Sync()
 	if err != nil {
