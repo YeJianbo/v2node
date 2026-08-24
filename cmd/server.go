@@ -69,9 +69,13 @@ func resolveDefaultConfigPath() string {
 }
 
 func serverHandle(_ *cobra.Command, _ []string) {
+	runServer(config, nil, watch)
+}
+
+func runServer(configPath string, reloadCh chan struct{}, watchConfig bool) {
 	showVersion()
 	c := conf.New()
-	err := c.LoadFromPath(config)
+	err := c.LoadFromPath(configPath)
 	log.SetFormatter(&log.TextFormatter{
 		DisableTimestamp: true,
 		DisableQuote:     true,
@@ -117,7 +121,9 @@ func serverHandle(_ *cobra.Command, _ []string) {
 	}
 	log.Info("Got nodes info from server")
 	//core
-	var reloadCh = make(chan struct{}, 1)
+	if reloadCh == nil {
+		reloadCh = make(chan struct{}, 1)
+	}
 	v2core := core.New(c)
 	v2core.ReloadCh = reloadCh
 	err = v2core.Start(nodes.NodeInfos)
@@ -133,9 +139,9 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		return
 	}
 	log.Info("Nodes started")
-	if watch {
+	if watchConfig {
 		// On file change, just signal reload; do not run reload concurrently here
-		err = c.Watch(config, func() {
+		err = c.Watch(configPath, func() {
 			select {
 			case reloadCh <- struct{}{}:
 			default: // drop if a reload is already queued
@@ -159,7 +165,7 @@ func serverHandle(_ *cobra.Command, _ []string) {
 			os.Exit(0)
 		case <-reloadCh:
 			log.Info("收到重启信号，正在重新加载配置...")
-			if err := reload(config, &nodes, &v2core); err != nil {
+			if err := reload(configPath, &nodes, &v2core); err != nil {
 				log.WithField("err", err).Panic("重启失败")
 			}
 			log.Info("重启成功")

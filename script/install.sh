@@ -637,11 +637,11 @@ exec /usr/local/v2node/v2node server -c "\${BUNCLOUD_CONFIG_PATH:-${CONFIG_FILE}
 EOF
     chmod +x /usr/local/v2node/run.sh
     install -d -m 0755 /usr/local/ravel
-    if ! curl -fsSL "${SCRIPT_BASE_URL}/v2node-probe.sh" -o /usr/local/ravel/ravel.sh; then
-        echo -e "${red}下载探针同步脚本失败${plain}"
+    install -m 0755 /usr/local/v2node/v2node /usr/local/ravel/ravel
+    if ! /usr/local/ravel/ravel ravel --help >/dev/null 2>&1; then
+        echo -e "${red}当前 Release 尚未包含原生 Ravel，请安装支持 ravel 子命令的新版本${plain}"
         exit 1
     fi
-    chmod +x /usr/local/ravel/ravel.sh
     if [[ x"${release}" == x"alpine" ]]; then
         rm /etc/init.d/v2node -f
         cat <<EOF > /etc/init.d/v2node
@@ -971,9 +971,6 @@ setup_machine_probe() {
         }' > "$PROBE_STATE_FILE"
     chmod 600 "$PROBE_STATE_FILE" >/dev/null 2>&1 || true
 
-    install -d -m 0755 /usr/local/ravel
-    chmod 0755 /usr/local/ravel/ravel.sh
-
     if [[ x"${release}" == x"alpine" ]]; then
         cat <<EOF > /etc/init.d/ravel
 #!/sbin/openrc-run
@@ -981,8 +978,8 @@ setup_machine_probe() {
 name="ravel"
 description="Ravel sync service"
 
-command="/usr/local/ravel/ravel.sh"
-command_args="daemon"
+command="/usr/local/ravel/ravel"
+command_args="ravel"
 command_user="root"
 pidfile="/run/ravel.pid"
 command_background="yes"
@@ -1007,7 +1004,8 @@ EOF
         service ravel restart >/dev/null 2>&1 || service ravel start >/dev/null 2>&1
         service v2node-probe stop >/dev/null 2>&1 || true
         rc-update del v2node-probe default >/dev/null 2>&1 || true
-        service v2node start >/dev/null 2>&1 || true
+        service v2node stop >/dev/null 2>&1 || true
+        rc-update del v2node default >/dev/null 2>&1 || true
     else
         cat <<EOF > /etc/systemd/system/ravel.service
 [Unit]
@@ -1019,7 +1017,7 @@ Wants=network.target
 Type=simple
 User=root
 Group=root
-ExecStart=/usr/local/ravel/ravel.sh daemon
+ExecStart=/usr/local/ravel/ravel ravel
 Restart=always
 RestartSec=5
 
@@ -1027,14 +1025,12 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
-        systemctl enable v2node >/dev/null 2>&1 || true
+        systemctl disable --now v2node >/dev/null 2>&1 || true
         systemctl enable ravel >/dev/null 2>&1 || true
-        systemctl restart v2node >/dev/null 2>&1 || systemctl start v2node >/dev/null 2>&1
         systemctl restart ravel >/dev/null 2>&1 || systemctl start ravel >/dev/null 2>&1
         systemctl disable --now v2node-probe >/dev/null 2>&1 || true
     fi
 
-    /usr/local/ravel/ravel.sh sync >/dev/null 2>&1 || true
 }
 
 parse_args "$@"

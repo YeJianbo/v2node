@@ -71,6 +71,25 @@ func ReadConfigKeyFromEnv() ([]byte, error) {
 	if raw := strings.TrimSpace(os.Getenv(LegacyConfigEnvKey)); raw != "" {
 		return ParseConfigKey(raw)
 	}
+	paths := []string{
+		strings.TrimSpace(os.Getenv("BUNCLOUD_CONFIG_KEY_FILE")),
+		strings.TrimSpace(os.Getenv("V2NODE_CONFIG_KEY_FILE")),
+		"/etc/.buncloud-agent/config.key",
+		"/etc/v2node/config.key",
+	}
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		key, err := ParseConfigKey(string(raw))
+		if err == nil {
+			return key, nil
+		}
+	}
 	return nil, fmt.Errorf("missing config key in %s/%s", ConfigEnvKey, LegacyConfigEnvKey)
 }
 
