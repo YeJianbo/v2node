@@ -16,7 +16,7 @@ LEGACY_CONFIG_DIR="/etc/v2node"
 CONFIG_FILE="${V2NODE_CONFIG_FILE:-${CONFIG_DIR}/config.enc.json}"
 PLAIN_CONFIG_FILE="${V2NODE_CONFIG_PLAIN_FILE:-${CONFIG_DIR}/config.json}"
 CONFIG_KEY_FILE="${V2NODE_CONFIG_KEY_FILE:-${CONFIG_DIR}/config.key}"
-PROBE_STATE_FILE="${V2NODE_PROBE_STATE_FILE:-${CONFIG_DIR}/probe-state.json}"
+PROBE_STATE_FILE="${V2NODE_PROBE_STATE_FILE:-${CONFIG_DIR}/state.json}"
 RUNTIME_ENV_FILE="${V2NODE_RUNTIME_ENV_FILE:-${CONFIG_DIR}/runtime.env}"
 CONFIG_ENCRYPTION_ENABLED=1
 
@@ -636,11 +636,12 @@ fi
 exec /usr/local/v2node/v2node server -c "\${BUNCLOUD_CONFIG_PATH:-${CONFIG_FILE}}" "\$@"
 EOF
     chmod +x /usr/local/v2node/run.sh
-    if ! curl -fsSL "${SCRIPT_BASE_URL}/v2node-probe.sh" -o /usr/local/v2node/v2node-probe.sh; then
+    install -d -m 0755 /usr/local/ravel
+    if ! curl -fsSL "${SCRIPT_BASE_URL}/v2node-probe.sh" -o /usr/local/ravel/ravel.sh; then
         echo -e "${red}下载探针同步脚本失败${plain}"
         exit 1
     fi
-    chmod +x /usr/local/v2node/v2node-probe.sh
+    chmod +x /usr/local/ravel/ravel.sh
     if [[ x"${release}" == x"alpine" ]]; then
         rm /etc/init.d/v2node -f
         cat <<EOF > /etc/init.d/v2node
@@ -801,6 +802,11 @@ EOF
 disable_machine_probe() {
     rm -f "$PROBE_STATE_FILE" "${LEGACY_CONFIG_DIR}/probe.env"
     if [[ x"${release}" == x"alpine" ]]; then
+        if [[ -f /etc/init.d/ravel ]]; then
+            service ravel stop >/dev/null 2>&1 || true
+            rc-update del ravel default >/dev/null 2>&1 || true
+            rm -f /etc/init.d/ravel
+        fi
         if [[ -f /etc/init.d/ravel-probe ]]; then
             service ravel-probe stop >/dev/null 2>&1 || true
             rc-update del ravel-probe default >/dev/null 2>&1 || true
@@ -812,6 +818,11 @@ disable_machine_probe() {
             rm -f /etc/init.d/v2node-probe
         fi
     else
+        if [[ -f /etc/systemd/system/ravel.service ]]; then
+            systemctl stop ravel >/dev/null 2>&1 || true
+            systemctl disable ravel >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/ravel.service
+        fi
         if [[ -f /etc/systemd/system/ravel-probe.service ]]; then
             systemctl stop ravel-probe >/dev/null 2>&1 || true
             systemctl disable ravel-probe >/dev/null 2>&1 || true
@@ -960,20 +971,20 @@ setup_machine_probe() {
         }' > "$PROBE_STATE_FILE"
     chmod 600 "$PROBE_STATE_FILE" >/dev/null 2>&1 || true
 
-    install -d -m 0755 /usr/local/ravel-probe
-    install -m 0755 /usr/local/v2node/v2node-probe.sh /usr/local/ravel-probe/ravel-probe.sh
+    install -d -m 0755 /usr/local/ravel
+    chmod 0755 /usr/local/ravel/ravel.sh
 
     if [[ x"${release}" == x"alpine" ]]; then
-        cat <<EOF > /etc/init.d/ravel-probe
+        cat <<EOF > /etc/init.d/ravel
 #!/sbin/openrc-run
 
-name="ravel-probe"
-description="Ravel probe sync service"
+name="ravel"
+description="Ravel sync service"
 
-command="/usr/local/ravel-probe/ravel-probe.sh"
+command="/usr/local/ravel/ravel.sh"
 command_args="daemon"
 command_user="root"
-pidfile="/run/ravel-probe.pid"
+pidfile="/run/ravel.pid"
 command_background="yes"
 
 start_pre() {
@@ -990,17 +1001,17 @@ depend() {
     need net
 }
 EOF
-        chmod +x /etc/init.d/ravel-probe
-        rc-update add ravel-probe default >/dev/null 2>&1 || true
-        rm -f /run/v2node.pid /run/ravel-probe.pid /run/v2node-probe.pid
-        service ravel-probe restart >/dev/null 2>&1 || service ravel-probe start >/dev/null 2>&1
+        chmod +x /etc/init.d/ravel
+        rc-update add ravel default >/dev/null 2>&1 || true
+        rm -f /run/v2node.pid /run/ravel.pid /run/ravel-probe.pid /run/v2node-probe.pid
+        service ravel restart >/dev/null 2>&1 || service ravel start >/dev/null 2>&1
         service v2node-probe stop >/dev/null 2>&1 || true
         rc-update del v2node-probe default >/dev/null 2>&1 || true
         service v2node start >/dev/null 2>&1 || true
     else
-        cat <<EOF > /etc/systemd/system/ravel-probe.service
+        cat <<EOF > /etc/systemd/system/ravel.service
 [Unit]
-Description=Ravel Probe Sync Service
+Description=Ravel Sync Service
 After=network.target
 Wants=network.target
 
@@ -1008,7 +1019,7 @@ Wants=network.target
 Type=simple
 User=root
 Group=root
-ExecStart=/usr/local/ravel-probe/ravel-probe.sh daemon
+ExecStart=/usr/local/ravel/ravel.sh daemon
 Restart=always
 RestartSec=5
 
@@ -1017,13 +1028,13 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable v2node >/dev/null 2>&1 || true
-        systemctl enable ravel-probe >/dev/null 2>&1 || true
+        systemctl enable ravel >/dev/null 2>&1 || true
         systemctl restart v2node >/dev/null 2>&1 || systemctl start v2node >/dev/null 2>&1
-        systemctl restart ravel-probe >/dev/null 2>&1 || systemctl start ravel-probe >/dev/null 2>&1
+        systemctl restart ravel >/dev/null 2>&1 || systemctl start ravel >/dev/null 2>&1
         systemctl disable --now v2node-probe >/dev/null 2>&1 || true
     fi
 
-    /usr/local/ravel-probe/ravel-probe.sh sync >/dev/null 2>&1 || true
+    /usr/local/ravel/ravel.sh sync >/dev/null 2>&1 || true
 }
 
 parse_args "$@"

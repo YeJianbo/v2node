@@ -13,6 +13,7 @@ fi
 CONFIG_DIR="${V2NODE_CONFIG_DIR:-${DEFAULT_CONFIG_DIR}}"
 if [[ -z "${V2NODE_CONFIG_DIR:-}" \
     && -z "${V2NODE_PROBE_STATE_FILE:-}" \
+    && ! -f "${DEFAULT_CONFIG_DIR}/state.json" \
     && ! -f "${DEFAULT_CONFIG_DIR}/probe-state.json" \
     && -f "${LEGACY_CONFIG_DIR}/probe.env" ]]; then
     CONFIG_DIR="$LEGACY_CONFIG_DIR"
@@ -20,14 +21,26 @@ if [[ -z "${V2NODE_CONFIG_DIR:-}" \
     CONFIG_FILE="${V2NODE_CONFIG_FILE:-${LEGACY_CONFIG_DIR}/config.json}"
     V2NODE_CONFIG_PLAIN=true
 else
-    STATE_FILE="${V2NODE_PROBE_STATE_FILE:-${CONFIG_DIR}/probe-state.json}"
+    STATE_FILE="${V2NODE_PROBE_STATE_FILE:-${CONFIG_DIR}/state.json}"
     CONFIG_FILE="${V2NODE_CONFIG_FILE:-${BUNCLOUD_CONFIG_PATH:-${CONFIG_DIR}/config.enc.json}}"
 fi
 CONFIG_KEY_FILE="${V2NODE_CONFIG_KEY_FILE:-${CONFIG_DIR}/config.key}"
-MANAGED_NODES_STATE_FILE="${V2NODE_PROBE_MANAGED_NODES_STATE_FILE:-${CONFIG_DIR}/probe-managed-nodes.json}"
-DDNS_STATE_FILE="${V2NODE_PROBE_DDNS_STATE_FILE:-${CONFIG_DIR}/probe-ddns.json}"
-UPDATE_STATE_FILE="${V2NODE_PROBE_UPDATE_STATE_FILE:-${CONFIG_DIR}/probe-update.json}"
-DAEMON_LOCK_DIR="${V2NODE_PROBE_LOCK_DIR:-/run/v2node-probe.lock}"
+MANAGED_NODES_STATE_FILE="${V2NODE_PROBE_MANAGED_NODES_STATE_FILE:-${CONFIG_DIR}/managed-nodes.json}"
+DDNS_STATE_FILE="${V2NODE_PROBE_DDNS_STATE_FILE:-${CONFIG_DIR}/ddns.json}"
+UPDATE_STATE_FILE="${V2NODE_PROBE_UPDATE_STATE_FILE:-${CONFIG_DIR}/update.json}"
+if [[ -z "${V2NODE_PROBE_STATE_FILE:-}" && ! -f "$STATE_FILE" && -f "${CONFIG_DIR}/probe-state.json" ]]; then
+    STATE_FILE="${CONFIG_DIR}/probe-state.json"
+fi
+if [[ -z "${V2NODE_PROBE_MANAGED_NODES_STATE_FILE:-}" && ! -f "$MANAGED_NODES_STATE_FILE" && -f "${CONFIG_DIR}/probe-managed-nodes.json" ]]; then
+    MANAGED_NODES_STATE_FILE="${CONFIG_DIR}/probe-managed-nodes.json"
+fi
+if [[ -z "${V2NODE_PROBE_DDNS_STATE_FILE:-}" && ! -f "$DDNS_STATE_FILE" && -f "${CONFIG_DIR}/probe-ddns.json" ]]; then
+    DDNS_STATE_FILE="${CONFIG_DIR}/probe-ddns.json"
+fi
+if [[ -z "${V2NODE_PROBE_UPDATE_STATE_FILE:-}" && ! -f "$UPDATE_STATE_FILE" && -f "${CONFIG_DIR}/probe-update.json" ]]; then
+    UPDATE_STATE_FILE="${CONFIG_DIR}/probe-update.json"
+fi
+DAEMON_LOCK_DIR="${V2NODE_PROBE_LOCK_DIR:-}"
 GOST_CONFIG_FILE="${V2NODE_PROBE_GOST_CONFIG_FILE:-/etc/gost/config.json}"
 GOST_CONFIG_BACKUP_FILE="${V2NODE_PROBE_GOST_CONFIG_BACKUP_FILE:-/etc/gost/config.json.last-good}"
 GOST_BIN="${V2NODE_PROBE_GOST_BIN:-/usr/bin/gost}"
@@ -42,7 +55,7 @@ CONFIG_CHANGED=0
 GOST_CONFIG_CHANGED=0
 
 log() {
-    echo "[v2node-probe] $*"
+    echo "[${PROBE_LOG_TAG:-v2node-probe}] $*"
 }
 
 fail() {
@@ -153,11 +166,17 @@ load_state() {
     case "$PROBE_PROTOCOL" in
         ravel-v1)
             PROBE_HEADER_PREFIX="X-Ravel"
-            PROBE_SERVICE_NAME="${PROBE_SERVICE_NAME:-ravel-probe}"
+            PROBE_SERVICE_NAME="${PROBE_SERVICE_NAME:-ravel}"
+            PROBE_LOG_TAG="ravel"
+            PROBE_USER_AGENT="ravel"
+            DAEMON_LOCK_DIR="${DAEMON_LOCK_DIR:-/run/ravel.lock}"
             ;;
         v2node-v1)
             PROBE_HEADER_PREFIX="X-V2Node"
             PROBE_SERVICE_NAME="${PROBE_SERVICE_NAME:-v2node-probe}"
+            PROBE_LOG_TAG="v2node-probe"
+            PROBE_USER_AGENT="v2node-probe"
+            DAEMON_LOCK_DIR="${DAEMON_LOCK_DIR:-/run/v2node-probe.lock}"
             ;;
         *)
             fail "不支持的探针协议: $PROBE_PROTOCOL"
@@ -868,7 +887,7 @@ get_latest_release_version() {
     local repo="${1:-$AUTO_UPDATE_REPO_DEFAULT}"
     curl -fsSL \
         -H 'Accept: application/vnd.github+json' \
-        -H 'User-Agent: v2node-probe' \
+        -H "User-Agent: ${PROBE_USER_AGENT:-ravel}" \
         "https://api.github.com/repos/${repo}/releases/latest" \
         | jq -r '(.tag_name // .name // "") | ltrimstr("v")' \
         | tr -d '\r' \
@@ -1747,7 +1766,7 @@ push_status() {
     listen_ports=$(read_listen_ports)
     listen_processes=$(read_listen_processes)
     uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d'.' -f1)
-    version="ravel-probe $(uname -s 2>/dev/null) $(uname -m 2>/dev/null)"
+    version="ravel $(uname -s 2>/dev/null) $(uname -m 2>/dev/null)"
     v2node_version=$(get_local_v2node_version)
     local_ipv4=$(read_local_ipv4)
     local_ipv6=$(read_local_ipv6)
