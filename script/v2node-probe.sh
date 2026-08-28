@@ -28,6 +28,7 @@ CONFIG_KEY_FILE="${V2NODE_CONFIG_KEY_FILE:-${CONFIG_DIR}/config.key}"
 MANAGED_NODES_STATE_FILE="${V2NODE_PROBE_MANAGED_NODES_STATE_FILE:-${CONFIG_DIR}/managed-nodes.json}"
 DDNS_STATE_FILE="${V2NODE_PROBE_DDNS_STATE_FILE:-${CONFIG_DIR}/ddns.json}"
 UPDATE_STATE_FILE="${V2NODE_PROBE_UPDATE_STATE_FILE:-${CONFIG_DIR}/update.json}"
+NETWORK_QUALITY_STATE_FILE="${V2NODE_PROBE_NETWORK_QUALITY_STATE_FILE:-${CONFIG_DIR}/network-quality.json}"
 if [[ -z "${V2NODE_PROBE_STATE_FILE:-}" && ! -f "$STATE_FILE" && -f "${CONFIG_DIR}/probe-state.json" ]]; then
     STATE_FILE="${CONFIG_DIR}/probe-state.json"
 fi
@@ -872,6 +873,118 @@ save_update_state() {
             last_error: $last_error
         }' > "$UPDATE_STATE_FILE"
     chmod 600 "$UPDATE_STATE_FILE" >/dev/null 2>&1 || true
+}
+
+save_network_quality_config() {
+    local quality_json="$1"
+    local previous_reported_at=0
+    if [[ -f "$NETWORK_QUALITY_STATE_FILE" ]]; then
+        previous_reported_at=$(jq -r '.last_reported_at // 0' "$NETWORK_QUALITY_STATE_FILE" 2>/dev/null || echo 0)
+    fi
+
+    ensure_private_dir "$(dirname "$NETWORK_QUALITY_STATE_FILE")"
+    if ! printf '%s' "$quality_json" | jq \
+        --argjson last_reported_at "${previous_reported_at:-0}" '
+        {
+            enabled: (.enabled == true),
+            interval_seconds: (((.interval_seconds // 300) | tonumber) | if . < 60 or . > 3600 then 300 else . end),
+            packet_count: (((.packet_count // 5) | tonumber) | if . < 1 or . > 20 then 5 else . end),
+            timeout_seconds: (((.timeout_seconds // 2) | tonumber) | if . < 1 or . > 10 then 2 else . end),
+            targets: [(.targets // [])[] | {
+                key: (.key // ""),
+                name: (.name // ""),
+                host: (.host // "")
+            }],
+            last_reported_at: $last_reported_at
+        }
+    ' > "${NETWORK_QUALITY_STATE_FILE}.tmp"; then
+        rm -f "${NETWORK_QUALITY_STATE_FILE}.tmp"
+        return 1
+    fi
+    mv "${NETWORK_QUALITY_STATE_FILE}.tmp" "$NETWORK_QUALITY_STATE_FILE"
+    chmod 600 "$NETWORK_QUALITY_STATE_FILE" >/dev/null 2>&1 || true
+}
+
+probe_network_quality_target() {
+    local key="$1"
+    local host="$2"
+    local packet_count="$3"
+    local timeout_seconds="$4"
+    local output sent received loss rtt latency_min latency_avg latency_max
+
+    output=''
+    if command -v ping >/dev/null 2>&1; then
+        output=$(LC_ALL=C ping -n -c "$packet_count" -W "$timeout_seconds" "$host" 2>&1 || true)
+    fi
+    sent=$(printf '%s\n' "$output" | sed -nE 's/^([0-9]+) packets transmitted, ([0-9]+)( packets)? received.*/\1/p' | tail -n 1)
+    received=$(printf '%s\n' "$output" | sed -nE 's/^([0-9]+) packets transmitted, ([0-9]+)( packets)? received.*/\2/p' | tail -n 1)
+    loss=$(printf '%s\n' "$output" | sed -nE 's/.* ([0-9]+([.][0-9]+)?)% packet loss.*/\1/p' | tail -n 1)
+    rtt=$(printf '%s\n' "$output" | sed -nE 's@^.* = ([0-9.]+)/([0-9.]+)/([0-9.]+)/[0-9.]+ ms.*@\1 \2 \3@p' | tail -n 1)
+    read -r latency_min latency_avg latency_max <<< "$rtt"
+
+    sent="${sent:-$packet_count}"
+    received="${received:-0}"
+    loss="${loss:-100}"
+    jq -nc \
+        --arg key "$key" \
+        --argjson sent "$sent" \
+        --argjson received "$received" \
+        --argjson packet_loss "$loss" \
+        --arg latency_min "${latency_min:-}" \
+        --arg latency_avg "${latency_avg:-}" \
+        --arg latency_max "${latency_max:-}" '
+        {
+            key: $key,
+            sent: $sent,
+            received: $received,
+            packet_loss: $packet_loss,
+            latency_min: (if $latency_min == "" then null else ($latency_min | tonumber) end),
+            latency_avg: (if $latency_avg == "" then null else ($latency_avg | tonumber) end),
+            latency_max: (if $latency_max == "" then null else ($latency_max | tonumber) end)
+        }'
+}
+
+maybe_report_network_quality() {
+    [[ -f "$NETWORK_QUALITY_STATE_FILE" ]] || return 0
+    local enabled interval packet_count timeout_seconds last_reported_at target_count now
+    enabled=$(jq -r '.enabled // false' "$NETWORK_QUALITY_STATE_FILE")
+    [[ "$enabled" == "true" ]] || return 0
+    interval=$(jq -r '.interval_seconds // 300' "$NETWORK_QUALITY_STATE_FILE")
+    packet_count=$(jq -r '.packet_count // 5' "$NETWORK_QUALITY_STATE_FILE")
+    timeout_seconds=$(jq -r '.timeout_seconds // 2' "$NETWORK_QUALITY_STATE_FILE")
+    last_reported_at=$(jq -r '.last_reported_at // 0' "$NETWORK_QUALITY_STATE_FILE")
+    target_count=$(jq -r '(.targets // []) | length' "$NETWORK_QUALITY_STATE_FILE")
+    [[ "$target_count" == "3" ]] || return 0
+    now=$(date +%s)
+    if (( now - last_reported_at < interval )); then
+        return 0
+    fi
+
+    local tmp_dir index target key host pid samples body
+    tmp_dir=$(mktemp -d)
+    index=0
+    while IFS= read -r target; do
+        key=$(printf '%s' "$target" | jq -r '.key // ""')
+        host=$(printf '%s' "$target" | jq -r '.host // ""')
+        probe_network_quality_target "$key" "$host" "$packet_count" "$timeout_seconds" > "${tmp_dir}/${index}.json" &
+        pid=$!
+        printf '%s\n' "$pid" >> "${tmp_dir}/pids"
+        index=$((index + 1))
+    done < <(jq -c '.targets[]' "$NETWORK_QUALITY_STATE_FILE")
+
+    while IFS= read -r pid; do
+        wait "$pid" || true
+    done < "${tmp_dir}/pids"
+    samples=$(jq -s '.' "${tmp_dir}"/*.json 2>/dev/null || echo '[]')
+    rm -rf "$tmp_dir"
+    [[ "$(printf '%s' "$samples" | jq 'length')" == "3" ]] || return 1
+
+    body=$(jq -nc --argjson samples "$samples" '{samples:$samples}')
+    if ! signed_post_json "/api/v1/server/machine/networkQuality" "$body" >/dev/null; then
+        return 1
+    fi
+    jq --argjson now "$now" '.last_reported_at = $now' "$NETWORK_QUALITY_STATE_FILE" > "${NETWORK_QUALITY_STATE_FILE}.tmp" \
+        && mv "${NETWORK_QUALITY_STATE_FILE}.tmp" "$NETWORK_QUALITY_STATE_FILE"
 }
 
 get_local_v2node_version() {
@@ -2304,6 +2417,8 @@ sync_once() {
     relay_json=$(printf '%s' "$response" | jq -c '.probe.relay // {}')
     local connectivity_test_json
     connectivity_test_json=$(printf '%s' "$response" | jq -c '.probe.connectivity_test_task // null')
+    local network_quality_json
+    network_quality_json=$(printf '%s' "$response" | jq -c '.probe.network_quality // {enabled:false}')
     local combined_firewall_json
     combined_firewall_json=$(jq -cn \
         --argjson firewall "$firewall_json" \
@@ -2426,6 +2541,8 @@ sync_once() {
     rm -f "$previous_v2node_config" "$previous_v2node_plain_config" "$previous_managed_nodes_state"
 
     maybe_auto_update "$auto_update_json" || true
+    save_network_quality_config "$network_quality_json" || true
+    maybe_report_network_quality || true
 
     push_status || true
 }
@@ -2459,6 +2576,7 @@ daemon_loop() {
             last_sync_at="$now"
         else
             push_status || true
+            maybe_report_network_quality || true
         fi
 
         sleep "${STATUS_INTERVAL:-$STATUS_INTERVAL_DEFAULT}"

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -63,6 +64,35 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 	statusTicker := time.NewTicker(time.Duration(state.StatusInterval) * time.Second)
 	defer syncTicker.Stop()
 	defer statusTicker.Stop()
+	var qualityRunning atomic.Bool
+	qualityNext := time.Now()
+	qualityFingerprint := ""
+	maybeRunNetworkQuality := func() {
+		config := controller.NetworkQualityConfig()
+		fingerprint := agent.NetworkQualityFingerprint(config)
+		if !config.Enabled {
+			qualityFingerprint = fingerprint
+			qualityNext = time.Time{}
+			return
+		}
+		if fingerprint != qualityFingerprint {
+			qualityFingerprint = fingerprint
+			qualityNext = time.Now()
+		}
+		if !qualityNext.IsZero() && time.Now().Before(qualityNext) {
+			return
+		}
+		if !qualityRunning.CompareAndSwap(false, true) {
+			return
+		}
+		qualityNext = time.Now().Add(agent.NetworkQualityInterval(config))
+		go func() {
+			defer qualityRunning.Store(false)
+			if err := controller.ProbeAndPushNetworkQuality(); err != nil {
+				log.WithError(err).Warn("Ravel network quality report failed")
+			}
+		}()
+	}
 	for {
 		select {
 		case <-syncTicker.C:
@@ -82,6 +112,7 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 			if err := controller.PushStatus(agent.CollectStatus(nodeCount)); err != nil {
 				log.WithError(err).Warn("Ravel status report failed")
 			}
+			maybeRunNetworkQuality()
 		}
 	}
 }

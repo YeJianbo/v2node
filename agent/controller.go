@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wyx2685/v2node/common/crypt"
@@ -33,7 +34,8 @@ type ConfigResponse struct {
 }
 
 type ProbeConfig struct {
-	Relay RelayConfig `json:"relay"`
+	Relay          RelayConfig          `json:"relay"`
+	NetworkQuality NetworkQualityConfig `json:"network_quality"`
 }
 
 type Controller struct {
@@ -42,6 +44,8 @@ type Controller struct {
 	KeyFile     string
 	ManagedFile string
 	Relay       *RelayManager
+	qualityMu   sync.RWMutex
+	quality     NetworkQualityConfig
 }
 
 func LoadState(path string) (State, error) {
@@ -74,6 +78,7 @@ func (c *Controller) Sync() (bool, int, error) {
 	if c.Relay != nil {
 		_, _ = c.Relay.Sync(response.Probe.Relay)
 	}
+	c.setNetworkQualityConfig(response.Probe.NetworkQuality)
 	changed, err := c.writeMergedConfig(response.Data)
 	if err != nil {
 		return false, 0, err
@@ -90,6 +95,21 @@ func (c *Controller) Sync() (bool, int, error) {
 		}
 	}
 	return changed || restartRequested, len(response.Data), nil
+}
+
+func (c *Controller) setNetworkQualityConfig(config NetworkQualityConfig) {
+	config = normalizeNetworkQualityConfig(config)
+	c.qualityMu.Lock()
+	c.quality = config
+	c.qualityMu.Unlock()
+}
+
+func (c *Controller) NetworkQualityConfig() NetworkQualityConfig {
+	c.qualityMu.RLock()
+	defer c.qualityMu.RUnlock()
+	config := c.quality
+	config.Targets = append([]NetworkQualityTarget(nil), config.Targets...)
+	return config
 }
 
 func (c *Controller) PushStatus(status map[string]any) error {
