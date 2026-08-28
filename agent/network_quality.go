@@ -19,9 +19,10 @@ var (
 )
 
 type NetworkQualityTarget struct {
-	Key  string `json:"key"`
-	Name string `json:"name"`
-	Host string `json:"host"`
+	Key       string `json:"key"`
+	Name      string `json:"name"`
+	Host      string `json:"host"`
+	IPVersion string `json:"ip_version"`
 }
 
 type NetworkQualityConfig struct {
@@ -55,6 +56,11 @@ func normalizeNetworkQualityConfig(config NetworkQualityConfig) NetworkQualityCo
 	if len(config.Targets) < 1 || len(config.Targets) > 8 {
 		config.Enabled = false
 	}
+	for index := range config.Targets {
+		if config.Targets[index].IPVersion != "4" && config.Targets[index].IPVersion != "6" {
+			config.Targets[index].IPVersion = "auto"
+		}
+	}
 	return config
 }
 
@@ -83,14 +89,27 @@ func collectNetworkQuality(config NetworkQualityConfig) []NetworkQualitySample {
 }
 
 func pingNetworkQualityTarget(target NetworkQualityTarget, count, timeoutSeconds int) NetworkQualitySample {
-	args := []string{"-n", "-c", strconv.Itoa(count), "-W", strconv.Itoa(timeoutSeconds), target.Host}
-	if runtime.GOOS == "windows" {
-		args = []string{"-n", strconv.Itoa(count), "-w", strconv.Itoa(timeoutSeconds * 1000), target.Host}
-	}
+	args := networkQualityPingArgs(target, count, timeoutSeconds, runtime.GOOS)
 	command := exec.Command("ping", args...)
 	command.Env = append(command.Environ(), "LC_ALL=C", "LANG=C")
 	output, _ := command.CombinedOutput()
 	return parsePingOutput(target.Key, count, string(output))
+}
+
+func networkQualityPingArgs(target NetworkQualityTarget, count, timeoutSeconds int, goos string) []string {
+	args := []string{"-n"}
+	if target.IPVersion == "4" || target.IPVersion == "6" {
+		args = append(args, "-"+target.IPVersion)
+	}
+	args = append(args, "-c", strconv.Itoa(count), "-W", strconv.Itoa(timeoutSeconds), target.Host)
+	if goos == "windows" {
+		args = []string{}
+		if target.IPVersion == "4" || target.IPVersion == "6" {
+			args = append(args, "-"+target.IPVersion)
+		}
+		args = append(args, "-n", strconv.Itoa(count), "-w", strconv.Itoa(timeoutSeconds*1000), target.Host)
+	}
+	return args
 }
 
 func parsePingOutput(key string, requested int, output string) NetworkQualitySample {
@@ -131,7 +150,7 @@ func NetworkQualityFingerprint(config NetworkQualityConfig) string {
 		strconv.Itoa(config.TimeoutSeconds),
 	}
 	for _, target := range config.Targets {
-		parts = append(parts, target.Key, target.Host)
+		parts = append(parts, target.Key, target.Host, target.IPVersion)
 	}
 	return strings.Join(parts, "|")
 }

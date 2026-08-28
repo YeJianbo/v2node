@@ -1,6 +1,9 @@
 package agent
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestParsePingOutput(t *testing.T) {
 	output := `5 packets transmitted, 4 received, 20% packet loss, time 4004ms
@@ -31,5 +34,69 @@ round-trip min/avg/max = 1.407/1.931/3.805 ms`
 	}
 	if sample.LatencyAvg == nil || *sample.LatencyAvg != 1.931 {
 		t.Fatalf("unexpected BusyBox latency summary: %+v", sample)
+	}
+}
+
+func TestNormalizeNetworkQualityIPVersion(t *testing.T) {
+	config := normalizeNetworkQualityConfig(NetworkQualityConfig{
+		Enabled: true,
+		Targets: []NetworkQualityTarget{
+			{Key: "auto", Host: "dual.example.com"},
+			{Key: "v4", Host: "dual.example.com", IPVersion: "4"},
+			{Key: "invalid", Host: "dual.example.com", IPVersion: "ipv6"},
+		},
+	})
+
+	want := []string{"auto", "4", "auto"}
+	for index, target := range config.Targets {
+		if target.IPVersion != want[index] {
+			t.Fatalf("target %d IP version = %q, want %q", index, target.IPVersion, want[index])
+		}
+	}
+}
+
+func TestNetworkQualityPingArgs(t *testing.T) {
+	tests := []struct {
+		name   string
+		goos   string
+		target NetworkQualityTarget
+		want   []string
+	}{
+		{
+			name:   "linux ipv4",
+			goos:   "linux",
+			target: NetworkQualityTarget{Host: "dual.example.com", IPVersion: "4"},
+			want:   []string{"-n", "-4", "-c", "5", "-W", "2", "dual.example.com"},
+		},
+		{
+			name:   "linux auto",
+			goos:   "linux",
+			target: NetworkQualityTarget{Host: "dual.example.com", IPVersion: "auto"},
+			want:   []string{"-n", "-c", "5", "-W", "2", "dual.example.com"},
+		},
+		{
+			name:   "windows ipv6",
+			goos:   "windows",
+			target: NetworkQualityTarget{Host: "dual.example.com", IPVersion: "6"},
+			want:   []string{"-6", "-n", "5", "-w", "2000", "dual.example.com"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := networkQualityPingArgs(test.target, 5, 2, test.goos)
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("args = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNetworkQualityFingerprintIncludesIPVersion(t *testing.T) {
+	base := NetworkQualityConfig{Targets: []NetworkQualityTarget{{Key: "target", Host: "dual.example.com", IPVersion: "4"}}}
+	v6 := base
+	v6.Targets = []NetworkQualityTarget{{Key: "target", Host: "dual.example.com", IPVersion: "6"}}
+	if NetworkQualityFingerprint(base) == NetworkQualityFingerprint(v6) {
+		t.Fatal("fingerprint must change when the requested IP version changes")
 	}
 }

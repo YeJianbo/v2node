@@ -893,7 +893,8 @@ save_network_quality_config() {
             targets: [(.targets // [])[] | {
                 key: (.key // ""),
                 name: (.name // ""),
-                host: (.host // "")
+                host: (.host // ""),
+                ip_version: ((.ip_version // "auto") | if . == "4" or . == "6" then . else "auto" end)
             }],
             last_reported_at: $last_reported_at
         }
@@ -910,11 +911,16 @@ probe_network_quality_target() {
     local host="$2"
     local packet_count="$3"
     local timeout_seconds="$4"
+    local ip_version="${5:-auto}"
     local output sent received loss rtt latency_min latency_avg latency_max
 
     output=''
     if command -v ping >/dev/null 2>&1; then
-        output=$(LC_ALL=C ping -n -c "$packet_count" -W "$timeout_seconds" "$host" 2>&1 || true)
+        local family_args=()
+        if [[ "$ip_version" == "4" || "$ip_version" == "6" ]]; then
+            family_args=("-${ip_version}")
+        fi
+        output=$(LC_ALL=C ping "${family_args[@]}" -n -c "$packet_count" -W "$timeout_seconds" "$host" 2>&1 || true)
     fi
     sent=$(printf '%s\n' "$output" | sed -nE 's/^([0-9]+) packets transmitted, ([0-9]+)( packets)? received.*/\1/p' | tail -n 1)
     received=$(printf '%s\n' "$output" | sed -nE 's/^([0-9]+) packets transmitted, ([0-9]+)( packets)? received.*/\2/p' | tail -n 1)
@@ -960,13 +966,14 @@ maybe_report_network_quality() {
         return 0
     fi
 
-    local tmp_dir index target key host pid samples body
+    local tmp_dir index target key host ip_version pid samples body
     tmp_dir=$(mktemp -d)
     index=0
     while IFS= read -r target; do
         key=$(printf '%s' "$target" | jq -r '.key // ""')
         host=$(printf '%s' "$target" | jq -r '.host // ""')
-        probe_network_quality_target "$key" "$host" "$packet_count" "$timeout_seconds" > "${tmp_dir}/${index}.json" &
+        ip_version=$(printf '%s' "$target" | jq -r '.ip_version // "auto"')
+        probe_network_quality_target "$key" "$host" "$packet_count" "$timeout_seconds" "$ip_version" > "${tmp_dir}/${index}.json" &
         pid=$!
         printf '%s\n' "$pid" >> "${tmp_dir}/pids"
         index=$((index + 1))
