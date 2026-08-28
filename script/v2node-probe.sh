@@ -954,7 +954,7 @@ maybe_report_network_quality() {
     timeout_seconds=$(jq -r '.timeout_seconds // 2' "$NETWORK_QUALITY_STATE_FILE")
     last_reported_at=$(jq -r '.last_reported_at // 0' "$NETWORK_QUALITY_STATE_FILE")
     target_count=$(jq -r '(.targets // []) | length' "$NETWORK_QUALITY_STATE_FILE")
-    [[ "$target_count" == "3" ]] || return 0
+    (( target_count >= 1 && target_count <= 8 )) || return 0
     now=$(date +%s)
     if (( now - last_reported_at < interval )); then
         return 0
@@ -977,7 +977,7 @@ maybe_report_network_quality() {
     done < "${tmp_dir}/pids"
     samples=$(jq -s '.' "${tmp_dir}"/*.json 2>/dev/null || echo '[]')
     rm -rf "$tmp_dir"
-    [[ "$(printf '%s' "$samples" | jq 'length')" == "3" ]] || return 1
+    [[ "$(printf '%s' "$samples" | jq 'length')" == "$target_count" ]] || return 1
 
     body=$(jq -nc --argjson samples "$samples" '{samples:$samples}')
     if ! signed_post_json "/api/v1/server/machine/networkQuality" "$body" >/dev/null; then

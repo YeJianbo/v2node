@@ -52,7 +52,7 @@ func normalizeNetworkQualityConfig(config NetworkQualityConfig) NetworkQualityCo
 	if config.TimeoutSeconds < 1 || config.TimeoutSeconds > 10 {
 		config.TimeoutSeconds = 2
 	}
-	if len(config.Targets) != 3 {
+	if len(config.Targets) < 1 || len(config.Targets) > 8 {
 		config.Enabled = false
 	}
 	return config

@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"context"
+	"os"
+	"os/exec"
 	"sync/atomic"
 	"time"
 
@@ -32,6 +35,7 @@ func init() {
 }
 
 func ravelHandle(_ *cobra.Command, _ []string) {
+	agent.SetRuntimeVersion(version)
 	state, err := agent.LoadState(ravelStateFile)
 	if err != nil {
 		log.WithError(err).Fatal("load Ravel state failed")
@@ -65,8 +69,10 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 	defer syncTicker.Stop()
 	defer statusTicker.Stop()
 	var qualityRunning atomic.Bool
+	var updateRunning atomic.Bool
 	qualityNext := time.Now()
 	qualityFingerprint := ""
+	updateNext := time.Now()
 	maybeRunNetworkQuality := func() {
 		config := controller.NetworkQualityConfig()
 		fingerprint := agent.NetworkQualityFingerprint(config)
@@ -93,6 +99,43 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 			}
 		}()
 	}
+	maybeRunAutoUpdate := func() {
+		config := controller.AutoUpdateConfig()
+		if !config.Enabled {
+			updateNext = time.Time{}
+			return
+		}
+		if updateNext.IsZero() {
+			updateNext = time.Now()
+		}
+		if time.Now().Before(updateNext) || !updateRunning.CompareAndSwap(false, true) {
+			return
+		}
+		updateNext = time.Now().Add(agent.AutoUpdateInterval(config))
+		go func() {
+			defer updateRunning.Store(false)
+			binaryPath, err := os.Executable()
+			if err != nil {
+				log.WithError(err).Warn("resolve Ravel executable failed")
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			latest, updated, err := agent.CheckAndInstallRavelUpdate(ctx, config, version, binaryPath)
+			if err != nil {
+				log.WithError(err).Warn("Ravel auto update check failed")
+				return
+			}
+			if !updated {
+				log.Debugf("Ravel is current at %s", latest)
+				return
+			}
+			log.Infof("Ravel updated from %s to %s; scheduling service restart", version, latest)
+			if err := scheduleRavelRestart(); err != nil {
+				log.WithError(err).Error("schedule Ravel restart failed")
+			}
+		}()
+	}
 	for {
 		select {
 		case <-syncTicker.C:
@@ -113,6 +156,12 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 				log.WithError(err).Warn("Ravel status report failed")
 			}
 			maybeRunNetworkQuality()
+			maybeRunAutoUpdate()
 		}
 	}
+}
+
+func scheduleRavelRestart() error {
+	command := exec.Command("sh", "-c", "(sleep 2; if command -v systemctl >/dev/null 2>&1; then systemctl restart ravel; else service ravel restart; fi) >/dev/null 2>&1 &")
+	return command.Run()
 }

@@ -20,10 +20,20 @@ var cpuState struct {
 	previous cpuCounters
 }
 
+var runtimeVersion = "unknown"
+
+func SetRuntimeVersion(version string) {
+	version = strings.TrimSpace(version)
+	if version != "" {
+		runtimeVersion = version
+	}
+}
+
 func CollectStatus(nodeCount int) map[string]any {
 	hostname, _ := os.Hostname()
 	status := map[string]any{
-		"version":       "ravel-native",
+		"version":       "ravel " + runtimeVersion,
+		"ravel_version": runtimeVersion,
 		"hostname":      hostname,
 		"os":            readOSName(),
 		"kernel":        readTrimmedFile("/proc/sys/kernel/osrelease"),

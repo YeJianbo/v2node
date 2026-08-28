@@ -34,6 +34,7 @@ type ConfigResponse struct {
 }
 
 type ProbeConfig struct {
+	AutoUpdate     AutoUpdateConfig     `json:"auto_update"`
 	Relay          RelayConfig          `json:"relay"`
 	NetworkQuality NetworkQualityConfig `json:"network_quality"`
 }
@@ -46,6 +47,8 @@ type Controller struct {
 	Relay       *RelayManager
 	qualityMu   sync.RWMutex
 	quality     NetworkQualityConfig
+	updateMu    sync.RWMutex
+	autoUpdate  AutoUpdateConfig
 }
 
 func LoadState(path string) (State, error) {
@@ -79,6 +82,7 @@ func (c *Controller) Sync() (bool, int, error) {
 		_, _ = c.Relay.Sync(response.Probe.Relay)
 	}
 	c.setNetworkQualityConfig(response.Probe.NetworkQuality)
+	c.setAutoUpdateConfig(response.Probe.AutoUpdate)
 	changed, err := c.writeMergedConfig(response.Data)
 	if err != nil {
 		return false, 0, err
@@ -95,6 +99,19 @@ func (c *Controller) Sync() (bool, int, error) {
 		}
 	}
 	return changed || restartRequested, len(response.Data), nil
+}
+
+func (c *Controller) setAutoUpdateConfig(config AutoUpdateConfig) {
+	config = normalizeAutoUpdateConfig(config)
+	c.updateMu.Lock()
+	c.autoUpdate = config
+	c.updateMu.Unlock()
+}
+
+func (c *Controller) AutoUpdateConfig() AutoUpdateConfig {
+	c.updateMu.RLock()
+	defer c.updateMu.RUnlock()
+	return c.autoUpdate
 }
 
 func (c *Controller) setNetworkQualityConfig(config NetworkQualityConfig) {
