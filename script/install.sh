@@ -787,35 +787,43 @@ EOF
     fi
 
 
-    curl -o /usr/bin/v2node -Ls "${SCRIPT_BASE_URL}/v2node.sh"
-    chmod +x /usr/bin/v2node
+    local manager_script_tmp
+    manager_script_tmp=$(mktemp)
+    if ! curl -fsSL "${SCRIPT_BASE_URL}/v2node.sh" -o "$manager_script_tmp" \
+        || ! bash -n "$manager_script_tmp"; then
+        rm -f "$manager_script_tmp"
+        echo -e "${red}下载或校验 Ravel 管理脚本失败，保留现有命令不变${plain}"
+        exit 1
+    fi
+    rm -f /usr/bin/ravel /usr/bin/v2node /usr/bin/v2bx
+    install -m 0755 "$manager_script_tmp" /usr/bin/ravel
+    rm -f "$manager_script_tmp"
+    ln -sf /usr/bin/ravel /usr/bin/v2node
+    ln -sf /usr/bin/ravel /usr/bin/v2bx
 
     cd $cur_dir
     rm -f install.sh
     echo "------------------------------------------"
     echo -e "管理脚本使用方法: "
     echo "------------------------------------------"
-    echo "v2node              - 显示管理菜单 (功能更多)"
-    echo "v2node start        - 启动 v2node"
-    echo "v2node stop         - 停止 v2node"
-    echo "v2node restart      - 重启 v2node"
-    echo "v2node status       - 查看 v2node 状态"
-    echo "v2node enable       - 设置 v2node 开机自启"
-    echo "v2node disable      - 取消 v2node 开机自启"
-    echo "v2node log          - 查看 v2node 日志"
-    echo "v2node generate     - 生成 v2node 配置文件"
-    echo "v2node update       - 更新 v2node"
-    echo "v2node update x.x.x - 更新 v2node 指定版本"
-    echo "v2node install      - 安装 v2node"
-    echo "v2node uninstall    - 卸载 v2node"
-    echo "v2node version      - 查看 v2node 版本"
+    echo "ravel               - 显示 Ravel 管理菜单"
+    echo "ravel start         - 启动 Ravel"
+    echo "ravel stop          - 停止 Ravel"
+    echo "ravel restart       - 重启 Ravel"
+    echo "ravel status        - 查看 Ravel 状态"
+    echo "ravel enable        - 设置 Ravel 开机自启"
+    echo "ravel disable       - 取消 Ravel 开机自启"
+    echo "ravel log           - 查看 Ravel 日志"
+    echo "ravel version       - 查看 Ravel 版本"
+    echo "ravel update        - 更新 Ravel"
+    echo "v2node / v2bx       - 兼容入口，同样进入 Ravel 管理"
     echo "------------------------------------------"
     curl -fsS --max-time 10 "https://api.v-50.me/counter" || true
 
     if [[ "$INSTALL_MODE_ARG" == "machine" ]]; then
-        echo -e "${green}已启用探针模式。后续在面板为该在线服务器分配 v2node 节点后，会自动同步到本机。${plain}"
+        echo -e "${green}已启用 Ravel 原生云控模式。后续在面板分配节点后会自动同步到本机。${plain}"
     elif [[ $first_install == true ]]; then
-        read -rp "检测到你为第一次安装 v2node，是否自动生成加密配置 ${CONFIG_FILE}？(y/n): " if_generate
+        read -rp "检测到你为第一次安装 Ravel，是否自动生成加密节点配置 ${CONFIG_FILE}？(y/n): " if_generate
         if [[ "$if_generate" =~ ^[Yy]$ ]]; then
             # 交互式收集参数，提供示例默认值
             read -rp "面板API地址[格式: https://example.com/]: " api_host
