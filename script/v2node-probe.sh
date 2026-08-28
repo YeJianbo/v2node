@@ -919,7 +919,7 @@ probe_network_quality_target() {
     sent=$(printf '%s\n' "$output" | sed -nE 's/^([0-9]+) packets transmitted, ([0-9]+)( packets)? received.*/\1/p' | tail -n 1)
     received=$(printf '%s\n' "$output" | sed -nE 's/^([0-9]+) packets transmitted, ([0-9]+)( packets)? received.*/\2/p' | tail -n 1)
     loss=$(printf '%s\n' "$output" | sed -nE 's/.* ([0-9]+([.][0-9]+)?)% packet loss.*/\1/p' | tail -n 1)
-    rtt=$(printf '%s\n' "$output" | sed -nE 's@^.* = ([0-9.]+)/([0-9.]+)/([0-9.]+)/[0-9.]+ ms.*@\1 \2 \3@p' | tail -n 1)
+    rtt=$(printf '%s\n' "$output" | sed -nE 's@^.* = ([0-9.]+)/([0-9.]+)/([0-9.]+)(/[0-9.]+)? ms.*@\1 \2 \3@p' | tail -n 1)
     read -r latency_min latency_avg latency_max <<< "$rtt"
 
     sent="${sent:-$packet_count}"

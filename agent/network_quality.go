@@ -15,7 +15,7 @@ const networkQualityPath = "/api/v1/server/machine/networkQuality"
 var (
 	packetSummaryPattern = regexp.MustCompile(`(?m)(\d+)\s+packets transmitted,\s+(\d+)\s+(?:packets )?received`)
 	packetLossPattern    = regexp.MustCompile(`(?m)([0-9]+(?:\.[0-9]+)?)%\s+packet loss`)
-	rttPattern           = regexp.MustCompile(`(?m)=\s*([0-9.]+)/([0-9.]+)/([0-9.]+)/(?:[0-9.]+)\s*ms`)
+	rttPattern           = regexp.MustCompile(`(?m)=\s*([0-9.]+)/([0-9.]+)/([0-9.]+)(?:/[0-9.]+)?\s*ms`)
 )
 
 type NetworkQualityTarget struct {

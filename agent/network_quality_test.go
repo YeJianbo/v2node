@@ -21,3 +21,15 @@ func TestParsePingOutputForTotalLoss(t *testing.T) {
 		t.Fatalf("unexpected total-loss sample: %+v", sample)
 	}
 }
+
+func TestParseBusyBoxPingOutput(t *testing.T) {
+	output := `5 packets transmitted, 5 packets received, 0% packet loss
+round-trip min/avg/max = 1.407/1.931/3.805 ms`
+	sample := parsePingOutput("dnspod", 5, output)
+	if sample.Sent != 5 || sample.Received != 5 || sample.PacketLoss != 0 {
+		t.Fatalf("unexpected BusyBox packet summary: %+v", sample)
+	}
+	if sample.LatencyAvg == nil || *sample.LatencyAvg != 1.931 {
+		t.Fatalf("unexpected BusyBox latency summary: %+v", sample)
+	}
+}
