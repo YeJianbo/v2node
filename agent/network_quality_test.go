@@ -100,3 +100,35 @@ func TestNetworkQualityFingerprintIncludesIPVersion(t *testing.T) {
 		t.Fatal("fingerprint must change when the requested IP version changes")
 	}
 }
+
+func TestDisabledNetworkQualityTargetsAreSkipped(t *testing.T) {
+	enabled := true
+	disabled := false
+	targets := []NetworkQualityTarget{
+		{Key: "legacy", Host: "legacy.example.com"},
+		{Key: "enabled", Host: "enabled.example.com", Enabled: &enabled},
+		{Key: "disabled", Host: "disabled.example.com", Enabled: &disabled},
+	}
+	got := enabledNetworkQualityTargets(targets)
+	if len(got) != 2 || got[0].Key != "legacy" || got[1].Key != "enabled" {
+		t.Fatalf("enabled targets = %#v", got)
+	}
+
+	config := normalizeNetworkQualityConfig(NetworkQualityConfig{
+		Enabled: true,
+		Targets: []NetworkQualityTarget{{Key: "disabled", Host: "disabled.example.com", Enabled: &disabled}},
+	})
+	if config.Enabled {
+		t.Fatal("network quality must stop when every target is disabled")
+	}
+}
+
+func TestNetworkQualityFingerprintIncludesEnabledState(t *testing.T) {
+	enabled := true
+	disabled := false
+	active := NetworkQualityConfig{Targets: []NetworkQualityTarget{{Key: "target", Host: "dual.example.com", Enabled: &enabled}}}
+	inactive := NetworkQualityConfig{Targets: []NetworkQualityTarget{{Key: "target", Host: "dual.example.com", Enabled: &disabled}}}
+	if NetworkQualityFingerprint(active) == NetworkQualityFingerprint(inactive) {
+		t.Fatal("fingerprint must change when a target is enabled or disabled")
+	}
+}

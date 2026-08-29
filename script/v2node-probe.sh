@@ -894,7 +894,8 @@ save_network_quality_config() {
                 key: (.key // ""),
                 name: (.name // ""),
                 host: (.host // ""),
-                ip_version: ((.ip_version // "auto") | if . == "4" or . == "6" then . else "auto" end)
+                ip_version: ((.ip_version // "auto") | if . == "4" or . == "6" then . else "auto" end),
+                enabled: (.enabled != false)
             }],
             last_reported_at: $last_reported_at
         }
@@ -959,7 +960,7 @@ maybe_report_network_quality() {
     packet_count=$(jq -r '.packet_count // 5' "$NETWORK_QUALITY_STATE_FILE")
     timeout_seconds=$(jq -r '.timeout_seconds // 2' "$NETWORK_QUALITY_STATE_FILE")
     last_reported_at=$(jq -r '.last_reported_at // 0' "$NETWORK_QUALITY_STATE_FILE")
-    target_count=$(jq -r '(.targets // []) | length' "$NETWORK_QUALITY_STATE_FILE")
+    target_count=$(jq -r '[.targets[] | select(.enabled != false)] | length' "$NETWORK_QUALITY_STATE_FILE")
     (( target_count >= 1 && target_count <= 8 )) || return 0
     now=$(date +%s)
     if (( now - last_reported_at < interval )); then
@@ -977,7 +978,7 @@ maybe_report_network_quality() {
         pid=$!
         printf '%s\n' "$pid" >> "${tmp_dir}/pids"
         index=$((index + 1))
-    done < <(jq -c '.targets[]' "$NETWORK_QUALITY_STATE_FILE")
+    done < <(jq -c '.targets[] | select(.enabled != false)' "$NETWORK_QUALITY_STATE_FILE")
 
     while IFS= read -r pid; do
         wait "$pid" || true

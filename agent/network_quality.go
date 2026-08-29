@@ -23,6 +23,7 @@ type NetworkQualityTarget struct {
 	Name      string `json:"name"`
 	Host      string `json:"host"`
 	IPVersion string `json:"ip_version"`
+	Enabled   *bool  `json:"enabled"`
 }
 
 type NetworkQualityConfig struct {
@@ -53,7 +54,7 @@ func normalizeNetworkQualityConfig(config NetworkQualityConfig) NetworkQualityCo
 	if config.TimeoutSeconds < 1 || config.TimeoutSeconds > 10 {
 		config.TimeoutSeconds = 2
 	}
-	if len(config.Targets) < 1 || len(config.Targets) > 8 {
+	if len(config.Targets) < 1 || len(config.Targets) > 8 || len(enabledNetworkQualityTargets(config.Targets)) < 1 {
 		config.Enabled = false
 	}
 	for index := range config.Targets {
@@ -75,9 +76,10 @@ func (c *Controller) ProbeAndPushNetworkQuality() error {
 }
 
 func collectNetworkQuality(config NetworkQualityConfig) []NetworkQualitySample {
-	samples := make([]NetworkQualitySample, len(config.Targets))
+	targets := enabledNetworkQualityTargets(config.Targets)
+	samples := make([]NetworkQualitySample, len(targets))
 	var group sync.WaitGroup
-	for index, target := range config.Targets {
+	for index, target := range targets {
 		group.Add(1)
 		go func() {
 			defer group.Done()
@@ -86,6 +88,16 @@ func collectNetworkQuality(config NetworkQualityConfig) []NetworkQualitySample {
 	}
 	group.Wait()
 	return samples
+}
+
+func enabledNetworkQualityTargets(targets []NetworkQualityTarget) []NetworkQualityTarget {
+	enabled := make([]NetworkQualityTarget, 0, len(targets))
+	for _, target := range targets {
+		if target.Enabled == nil || *target.Enabled {
+			enabled = append(enabled, target)
+		}
+	}
+	return enabled
 }
 
 func pingNetworkQualityTarget(target NetworkQualityTarget, count, timeoutSeconds int) NetworkQualitySample {
@@ -150,7 +162,7 @@ func NetworkQualityFingerprint(config NetworkQualityConfig) string {
 		strconv.Itoa(config.TimeoutSeconds),
 	}
 	for _, target := range config.Targets {
-		parts = append(parts, target.Key, target.Host, target.IPVersion)
+		parts = append(parts, target.Key, target.Host, target.IPVersion, strconv.FormatBool(target.Enabled == nil || *target.Enabled))
 	}
 	return strings.Join(parts, "|")
 }
