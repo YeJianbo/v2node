@@ -894,6 +894,8 @@ save_network_quality_config() {
                 key: (.key // ""),
                 name: (.name // ""),
                 host: (.host // ""),
+                probe_type: ((.probe_type // "icmp") | if . == "tcp" then . else "icmp" end),
+                port: (((.port // 80) | tonumber) | if . < 1 or . > 65535 then 80 else . end),
                 ip_version: ((.ip_version // "auto") | if . == "4" or . == "6" then . else "auto" end),
                 enabled: (.enabled != false)
             }],
@@ -951,6 +953,68 @@ probe_network_quality_target() {
         }'
 }
 
+probe_network_quality_tcp_target() {
+    local key="$1"
+    local host="$2"
+    local port="$3"
+    local packet_count="$4"
+    local timeout_seconds="$5"
+    local ip_version="${6:-auto}"
+    local received=0 index start_ns end_ns elapsed_ms loss latency_min latency_avg latency_max
+    local latencies=()
+    local family_args=()
+    if [[ "$ip_version" == "4" || "$ip_version" == "6" ]]; then
+        family_args=("-${ip_version}")
+    fi
+
+    for ((index = 0; index < packet_count; index++)); do
+        local connected=false
+        start_ns=$(date +%s%N)
+        if command -v nc >/dev/null 2>&1; then
+            if nc "${family_args[@]}" -z -w "$timeout_seconds" "$host" "$port" >/dev/null 2>&1; then
+                connected=true
+            fi
+        elif command -v timeout >/dev/null 2>&1; then
+            if timeout "$timeout_seconds" bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" >/dev/null 2>&1; then
+                connected=true
+            fi
+        fi
+        if [[ "$connected" == "true" ]]; then
+            end_ns=$(date +%s%N)
+            elapsed_ms=$(awk -v start="$start_ns" -v end="$end_ns" 'BEGIN { printf "%.3f", (end - start) / 1000000 }')
+            latencies+=("$elapsed_ms")
+            received=$((received + 1))
+        fi
+    done
+
+    loss=$(awk -v sent="$packet_count" -v received="$received" 'BEGIN { printf "%.3f", (sent - received) * 100 / sent }')
+    if (( received > 0 )); then
+        read -r latency_min latency_avg latency_max < <(printf '%s\n' "${latencies[@]}" | awk '
+            NR == 1 { min = max = $1 }
+            { if ($1 < min) min = $1; if ($1 > max) max = $1; total += $1 }
+            END { printf "%.3f %.3f %.3f\n", min, total / NR, max }
+        ')
+    fi
+
+    jq -nc \
+        --arg key "$key" \
+        --argjson sent "$packet_count" \
+        --argjson received "$received" \
+        --argjson packet_loss "$loss" \
+        --arg latency_min "${latency_min:-}" \
+        --arg latency_avg "${latency_avg:-}" \
+        --arg latency_max "${latency_max:-}" '
+        {
+            key: $key,
+            sent: $sent,
+            received: $received,
+            packet_loss: $packet_loss,
+            latency_min: (if $latency_min == "" then null else ($latency_min | tonumber) end),
+            latency_avg: (if $latency_avg == "" then null else ($latency_avg | tonumber) end),
+            latency_max: (if $latency_max == "" then null else ($latency_max | tonumber) end)
+        }'
+}
+
 maybe_report_network_quality() {
     [[ -f "$NETWORK_QUALITY_STATE_FILE" ]] || return 0
     local enabled interval packet_count timeout_seconds last_reported_at target_count now
@@ -967,14 +1031,20 @@ maybe_report_network_quality() {
         return 0
     fi
 
-    local tmp_dir index target key host ip_version pid samples body
+    local tmp_dir index target key host probe_type port ip_version pid samples body
     tmp_dir=$(mktemp -d)
     index=0
     while IFS= read -r target; do
         key=$(printf '%s' "$target" | jq -r '.key // ""')
         host=$(printf '%s' "$target" | jq -r '.host // ""')
+        probe_type=$(printf '%s' "$target" | jq -r '.probe_type // "icmp"')
+        port=$(printf '%s' "$target" | jq -r '.port // 80')
         ip_version=$(printf '%s' "$target" | jq -r '.ip_version // "auto"')
-        probe_network_quality_target "$key" "$host" "$packet_count" "$timeout_seconds" "$ip_version" > "${tmp_dir}/${index}.json" &
+        if [[ "$probe_type" == "tcp" ]]; then
+            probe_network_quality_tcp_target "$key" "$host" "$port" "$packet_count" "$timeout_seconds" "$ip_version" > "${tmp_dir}/${index}.json" &
+        else
+            probe_network_quality_target "$key" "$host" "$packet_count" "$timeout_seconds" "$ip_version" > "${tmp_dir}/${index}.json" &
+        fi
         pid=$!
         printf '%s\n' "$pid" >> "${tmp_dir}/pids"
         index=$((index + 1))

@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"net"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -130,5 +132,65 @@ func TestNetworkQualityFingerprintIncludesEnabledState(t *testing.T) {
 	inactive := NetworkQualityConfig{Targets: []NetworkQualityTarget{{Key: "target", Host: "dual.example.com", Enabled: &disabled}}}
 	if NetworkQualityFingerprint(active) == NetworkQualityFingerprint(inactive) {
 		t.Fatal("fingerprint must change when a target is enabled or disabled")
+	}
+}
+
+func TestNormalizeNetworkQualityProbeType(t *testing.T) {
+	config := normalizeNetworkQualityConfig(NetworkQualityConfig{
+		Enabled: true,
+		Targets: []NetworkQualityTarget{
+			{Key: "tcp", Host: "example.com", ProbeType: "tcp", Port: 8443},
+			{Key: "legacy", Host: "example.com"},
+			{Key: "invalid", Host: "example.com", ProbeType: "udp", Port: 70000},
+		},
+	})
+	if config.Targets[0].ProbeType != "tcp" || config.Targets[0].Port != 8443 {
+		t.Fatalf("TCP target was not preserved: %#v", config.Targets[0])
+	}
+	for _, index := range []int{1, 2} {
+		if config.Targets[index].ProbeType != "icmp" || config.Targets[index].Port != 80 {
+			t.Fatalf("target %d defaults = %#v", index, config.Targets[index])
+		}
+	}
+}
+
+func TestTCPNetworkQualityTarget(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = connection.Close()
+		}
+	}()
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	sample := tcpNetworkQualityTarget(NetworkQualityTarget{
+		Key:       "local-tcp",
+		Host:      "127.0.0.1",
+		ProbeType: "tcp",
+		Port:      port,
+		IPVersion: "4",
+	}, 3, 1)
+	if sample.Sent != 3 || sample.Received != 3 || sample.PacketLoss != 0 {
+		t.Fatalf("TCP sample = %#v (port %s)", sample, strconv.Itoa(port))
+	}
+	if sample.LatencyMin == nil || sample.LatencyAvg == nil || sample.LatencyMax == nil {
+		t.Fatalf("TCP latency was not recorded: %#v", sample)
+	}
+}
+
+func TestNetworkQualityFingerprintIncludesProbeTypeAndPort(t *testing.T) {
+	icmp := NetworkQualityConfig{Targets: []NetworkQualityTarget{{Key: "target", Host: "example.com", ProbeType: "icmp", Port: 443}}}
+	tcp := NetworkQualityConfig{Targets: []NetworkQualityTarget{{Key: "target", Host: "example.com", ProbeType: "tcp", Port: 443}}}
+	tcp8443 := NetworkQualityConfig{Targets: []NetworkQualityTarget{{Key: "target", Host: "example.com", ProbeType: "tcp", Port: 8443}}}
+	if NetworkQualityFingerprint(icmp) == NetworkQualityFingerprint(tcp) || NetworkQualityFingerprint(tcp) == NetworkQualityFingerprint(tcp8443) {
+		t.Fatal("fingerprint must change with the probe type or TCP port")
 	}
 }

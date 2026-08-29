@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"net"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -22,6 +23,8 @@ type NetworkQualityTarget struct {
 	Key       string `json:"key"`
 	Name      string `json:"name"`
 	Host      string `json:"host"`
+	ProbeType string `json:"probe_type"`
+	Port      int    `json:"port"`
 	IPVersion string `json:"ip_version"`
 	Enabled   *bool  `json:"enabled"`
 }
@@ -58,6 +61,12 @@ func normalizeNetworkQualityConfig(config NetworkQualityConfig) NetworkQualityCo
 		config.Enabled = false
 	}
 	for index := range config.Targets {
+		if config.Targets[index].ProbeType != "tcp" {
+			config.Targets[index].ProbeType = "icmp"
+		}
+		if config.Targets[index].Port < 1 || config.Targets[index].Port > 65535 {
+			config.Targets[index].Port = 80
+		}
 		if config.Targets[index].IPVersion != "4" && config.Targets[index].IPVersion != "6" {
 			config.Targets[index].IPVersion = "auto"
 		}
@@ -83,11 +92,54 @@ func collectNetworkQuality(config NetworkQualityConfig) []NetworkQualitySample {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			samples[index] = pingNetworkQualityTarget(target, config.PacketCount, config.TimeoutSeconds)
+			samples[index] = probeNetworkQualityTarget(target, config.PacketCount, config.TimeoutSeconds)
 		}()
 	}
 	group.Wait()
 	return samples
+}
+
+func probeNetworkQualityTarget(target NetworkQualityTarget, count, timeoutSeconds int) NetworkQualitySample {
+	if target.ProbeType == "tcp" {
+		return tcpNetworkQualityTarget(target, count, timeoutSeconds)
+	}
+	return pingNetworkQualityTarget(target, count, timeoutSeconds)
+}
+
+func tcpNetworkQualityTarget(target NetworkQualityTarget, count, timeoutSeconds int) NetworkQualitySample {
+	sample := NetworkQualitySample{Key: target.Key, Sent: count, PacketLoss: 100}
+	network := "tcp"
+	if target.IPVersion == "4" || target.IPVersion == "6" {
+		network += target.IPVersion
+	}
+	address := net.JoinHostPort(target.Host, strconv.Itoa(target.Port))
+	latencies := make([]float64, 0, count)
+	for range count {
+		startedAt := time.Now()
+		connection, err := net.DialTimeout(network, address, time.Duration(timeoutSeconds)*time.Second)
+		if err != nil {
+			continue
+		}
+		latencies = append(latencies, float64(time.Since(startedAt).Microseconds())/1000)
+		_ = connection.Close()
+	}
+	sample.Received = len(latencies)
+	if count > 0 {
+		sample.PacketLoss = float64(count-sample.Received) * 100 / float64(count)
+	}
+	if len(latencies) > 0 {
+		minimum, maximum, total := latencies[0], latencies[0], 0.0
+		for _, latency := range latencies {
+			minimum = min(minimum, latency)
+			maximum = max(maximum, latency)
+			total += latency
+		}
+		average := total / float64(len(latencies))
+		sample.LatencyMin = &minimum
+		sample.LatencyAvg = &average
+		sample.LatencyMax = &maximum
+	}
+	return sample
 }
 
 func enabledNetworkQualityTargets(targets []NetworkQualityTarget) []NetworkQualityTarget {
@@ -162,7 +214,7 @@ func NetworkQualityFingerprint(config NetworkQualityConfig) string {
 		strconv.Itoa(config.TimeoutSeconds),
 	}
 	for _, target := range config.Targets {
-		parts = append(parts, target.Key, target.Host, target.IPVersion, strconv.FormatBool(target.Enabled == nil || *target.Enabled))
+		parts = append(parts, target.Key, target.Host, target.ProbeType, strconv.Itoa(target.Port), target.IPVersion, strconv.FormatBool(target.Enabled == nil || *target.Enabled))
 	}
 	return strings.Join(parts, "|")
 }
