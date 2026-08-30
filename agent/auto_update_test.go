@@ -3,6 +3,9 @@ package agent
 import (
 	"archive/zip"
 	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -45,8 +48,40 @@ func TestReplaceRavelBinaryKeepsPreviousVersion(t *testing.T) {
 }
 
 func TestNormalizeAutoUpdateConfig(t *testing.T) {
-	config := normalizeAutoUpdateConfig(AutoUpdateConfig{Enabled: true})
+	config := normalizeAutoUpdateConfig(AutoUpdateConfig{
+		Enabled:       true,
+		RequestID:     "request-1",
+		TargetVersion: "v0.5.4-ravel4",
+	})
 	if config.IntervalSeconds != 86400 || config.Repo != "YeJianbo/v2node" {
 		t.Fatalf("unexpected normalized config: %+v", config)
+	}
+	if config.RequestID != "request-1" || config.TargetVersion != "v0.5.4-ravel4" {
+		t.Fatalf("manual update request was not preserved: %+v", config)
+	}
+}
+
+func TestFetchGitHubReleaseByTag(t *testing.T) {
+	requestedPath := ""
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestedPath = request.URL.Path
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"tag_name":"v0.5.4-ravel4","assets":[]}`))
+	}))
+	defer server.Close()
+
+	previousAPIBaseURL := githubAPIBaseURL
+	githubAPIBaseURL = server.URL
+	t.Cleanup(func() { githubAPIBaseURL = previousAPIBaseURL })
+
+	release, err := fetchGitHubRelease(context.Background(), "YeJianbo/v2node", "v0.5.4-ravel4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release.TagName != "v0.5.4-ravel4" {
+		t.Fatalf("unexpected release: %+v", release)
+	}
+	if requestedPath != "/repos/YeJianbo/v2node/releases/tags/v0.5.4-ravel4" {
+		t.Fatalf("unexpected release path: %s", requestedPath)
 	}
 }

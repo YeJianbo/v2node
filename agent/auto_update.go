@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,6 +22,9 @@ type AutoUpdateConfig struct {
 	Enabled         bool   `json:"enabled"`
 	IntervalSeconds int    `json:"interval_seconds"`
 	Repo            string `json:"repo"`
+	RequestID       string `json:"request_id"`
+	TargetVersion   string `json:"target_version"`
+	RequestedAt     int64  `json:"requested_at"`
 }
 
 type githubRelease struct {
@@ -55,23 +59,8 @@ func CheckAndInstallRavelUpdate(ctx context.Context, config AutoUpdateConfig, cu
 		return "", false, fmt.Errorf("current Ravel version %q is not a release version", currentVersion)
 	}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/"+config.Repo+"/releases/latest", nil)
+	release, err := fetchGitHubRelease(ctx, config.Repo, "")
 	if err != nil {
-		return "", false, err
-	}
-	request.Header.Set("Accept", "application/vnd.github+json")
-	request.Header.Set("User-Agent", "v2node-ravel-updater")
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		return "", false, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return "", false, fmt.Errorf("GitHub release API returned %s", response.Status)
-	}
-
-	var release githubRelease
-	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&release); err != nil {
 		return "", false, err
 	}
 	if !semver.IsValid(release.TagName) {
@@ -80,10 +69,66 @@ func CheckAndInstallRavelUpdate(ctx context.Context, config AutoUpdateConfig, cu
 	if semver.Compare(release.TagName, currentVersion) <= 0 {
 		return release.TagName, false, nil
 	}
+	if err := installRavelRelease(ctx, release, binaryPath); err != nil {
+		return release.TagName, false, err
+	}
+	return release.TagName, true, nil
+}
 
+var githubAPIBaseURL = "https://api.github.com"
+
+func CheckAndInstallRequestedRavelUpdate(ctx context.Context, config AutoUpdateConfig, currentVersion, binaryPath string) (string, bool, error) {
+	config = normalizeAutoUpdateConfig(config)
+	if strings.TrimSpace(config.RequestID) == "" {
+		return "", false, nil
+	}
+
+	release, err := fetchGitHubRelease(ctx, config.Repo, strings.TrimSpace(config.TargetVersion))
+	if err != nil {
+		return "", false, err
+	}
+	if !semver.IsValid(release.TagName) {
+		return "", false, fmt.Errorf("requested release has invalid version %q", release.TagName)
+	}
+	if strings.TrimSpace(currentVersion) == release.TagName {
+		return release.TagName, false, nil
+	}
+	if err := installRavelRelease(ctx, release, binaryPath); err != nil {
+		return release.TagName, false, err
+	}
+	return release.TagName, true, nil
+}
+
+func fetchGitHubRelease(ctx context.Context, repo, targetVersion string) (githubRelease, error) {
+	var release githubRelease
+	endpoint := strings.TrimRight(githubAPIBaseURL, "/") + "/repos/" + repo + "/releases/latest"
+	if targetVersion != "" {
+		endpoint = strings.TrimRight(githubAPIBaseURL, "/") + "/repos/" + repo + "/releases/tags/" + url.PathEscape(targetVersion)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return release, err
+	}
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("User-Agent", "v2node-ravel-updater")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return release, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return release, fmt.Errorf("GitHub release API returned %s", response.Status)
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&release); err != nil {
+		return release, err
+	}
+	return release, nil
+}
+
+func installRavelRelease(ctx context.Context, release githubRelease, binaryPath string) error {
 	assetName, err := ravelReleaseAssetName()
 	if err != nil {
-		return release.TagName, false, err
+		return err
 	}
 	assetURL := ""
 	for _, asset := range release.Assets {
@@ -93,17 +138,17 @@ func CheckAndInstallRavelUpdate(ctx context.Context, config AutoUpdateConfig, cu
 		}
 	}
 	if assetURL == "" {
-		return release.TagName, false, fmt.Errorf("release asset %s was not found", assetName)
+		return fmt.Errorf("release asset %s was not found", assetName)
 	}
 
 	archive, err := downloadUpdateAsset(ctx, assetURL)
 	if err != nil {
-		return release.TagName, false, err
+		return err
 	}
 	if err := replaceRavelBinary(binaryPath, archive); err != nil {
-		return release.TagName, false, err
+		return err
 	}
-	return release.TagName, true, nil
+	return nil
 }
 
 func ravelReleaseAssetName() (string, error) {

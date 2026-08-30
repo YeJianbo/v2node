@@ -18,6 +18,7 @@ import (
 const configPath = "/api/v1/server/machine/v2nodeConfig"
 const statusPath = "/api/v1/server/machine/push"
 const restartAckPath = "/api/v1/server/machine/restartAck"
+const updateAckPath = "/api/v1/server/machine/updateAck"
 
 type NodeConfig struct {
 	APIHost string `json:"ApiHost"`
@@ -112,6 +113,36 @@ func (c *Controller) AutoUpdateConfig() AutoUpdateConfig {
 	c.updateMu.RLock()
 	defer c.updateMu.RUnlock()
 	return c.autoUpdate
+}
+
+func (c *Controller) AcknowledgeUpdate(config AutoUpdateConfig, status, installedVersion, message string) error {
+	var response map[string]any
+	return c.Client.Post(updateAckPath, map[string]string{
+		"request_id":        config.RequestID,
+		"status":            status,
+		"target_version":    config.TargetVersion,
+		"installed_version": installedVersion,
+		"error":             truncateStatusMessage(message, 255),
+	}, &response)
+}
+
+func (c *Controller) ClearUpdateRequest(requestID string) {
+	c.updateMu.Lock()
+	if c.autoUpdate.RequestID == requestID {
+		c.autoUpdate.RequestID = ""
+		c.autoUpdate.TargetVersion = ""
+		c.autoUpdate.RequestedAt = 0
+	}
+	c.updateMu.Unlock()
+}
+
+func truncateStatusMessage(message string, limit int) string {
+	message = strings.TrimSpace(message)
+	runes := []rune(message)
+	if len(runes) <= limit {
+		return message
+	}
+	return string(runes[:limit])
 }
 
 func (c *Controller) setNetworkQualityConfig(config NetworkQualityConfig) {

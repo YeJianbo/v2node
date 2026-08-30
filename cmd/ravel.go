@@ -70,6 +70,8 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 	defer statusTicker.Stop()
 	var qualityRunning atomic.Bool
 	var updateRunning atomic.Bool
+	var currentUpdateVersion atomic.Value
+	currentUpdateVersion.Store(version)
 	qualityNext := time.Now()
 	qualityFingerprint := ""
 	updateNext := time.Now()
@@ -101,6 +103,52 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 	}
 	maybeRunAutoUpdate := func() {
 		config := controller.AutoUpdateConfig()
+		if config.RequestID != "" {
+			if !updateRunning.CompareAndSwap(false, true) {
+				return
+			}
+			go func(request agent.AutoUpdateConfig) {
+				defer updateRunning.Store(false)
+				binaryPath, err := os.Executable()
+				if err != nil {
+					log.WithError(err).Warn("resolve Ravel executable failed")
+					return
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+				defer cancel()
+				currentVersion, _ := currentUpdateVersion.Load().(string)
+				target, updated, updateErr := agent.CheckAndInstallRequestedRavelUpdate(
+					ctx,
+					request,
+					currentVersion,
+					binaryPath,
+				)
+				status := "success"
+				installedVersion := currentVersion
+				message := ""
+				if updateErr != nil {
+					status = "failed"
+					message = updateErr.Error()
+					log.WithError(updateErr).Warn("Ravel manual update failed")
+				} else if target != "" {
+					installedVersion = target
+					currentUpdateVersion.Store(target)
+				}
+				if err := controller.AcknowledgeUpdate(request, status, installedVersion, message); err != nil {
+					log.WithError(err).Warn("acknowledge Ravel manual update failed")
+				} else {
+					controller.ClearUpdateRequest(request.RequestID)
+				}
+				if updateErr != nil || !updated {
+					return
+				}
+				log.Infof("Ravel manually updated from %s to %s; scheduling service restart", currentVersion, target)
+				if err := scheduleRavelRestart(); err != nil {
+					log.WithError(err).Error("schedule Ravel restart failed")
+				}
+			}(config)
+			return
+		}
 		if !config.Enabled {
 			updateNext = time.Time{}
 			return
@@ -121,7 +169,8 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			defer cancel()
-			latest, updated, err := agent.CheckAndInstallRavelUpdate(ctx, config, version, binaryPath)
+			currentVersion, _ := currentUpdateVersion.Load().(string)
+			latest, updated, err := agent.CheckAndInstallRavelUpdate(ctx, config, currentVersion, binaryPath)
 			if err != nil {
 				log.WithError(err).Warn("Ravel auto update check failed")
 				return
@@ -130,7 +179,8 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 				log.Debugf("Ravel is current at %s", latest)
 				return
 			}
-			log.Infof("Ravel updated from %s to %s; scheduling service restart", version, latest)
+			currentUpdateVersion.Store(latest)
+			log.Infof("Ravel updated from %s to %s; scheduling service restart", currentVersion, latest)
 			if err := scheduleRavelRestart(); err != nil {
 				log.WithError(err).Error("schedule Ravel restart failed")
 			}
