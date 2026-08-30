@@ -4,6 +4,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -44,6 +46,94 @@ func TestReplaceRavelBinaryKeepsPreviousVersion(t *testing.T) {
 	}
 	if string(current) != "new-binary" || string(previous) != "old-binary" {
 		t.Fatalf("unexpected binaries: current=%q previous=%q", current, previous)
+	}
+}
+
+func TestPendingRavelUpdateDoesNotOverwriteRollbackBinary(t *testing.T) {
+	directory := t.TempDir()
+	binaryPath := filepath.Join(directory, "ravel")
+	if err := os.WriteFile(binaryPath, []byte("new-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(binaryPath+".previous", []byte("old-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePendingRavelUpdate(binaryPath, PendingRavelUpdate{TargetVersion: "v1.2.3"}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := installRavelRelease(context.Background(), githubRelease{TagName: "v1.2.3"}, binaryPath, "v1.2.2", "request-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous, err := os.ReadFile(binaryPath + ".previous")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(previous) != "old-binary" {
+		t.Fatalf("rollback binary was overwritten: %q", previous)
+	}
+}
+
+func TestVerifyReleaseAssetDigest(t *testing.T) {
+	data := []byte("verified-release")
+	digest := sha256.Sum256(data)
+	if err := verifyReleaseAssetDigest(data, "sha256:"+hex.EncodeToString(digest[:])); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyReleaseAssetDigest([]byte("tampered"), "sha256:"+hex.EncodeToString(digest[:])); err == nil {
+		t.Fatal("tampered release was accepted")
+	}
+}
+
+func TestRavelVersionOutputMustMatchReleaseTag(t *testing.T) {
+	if !ravelVersionOutputMatches("ravel v1.2.3 (Ravel integrated node runtime)", "v1.2.3") {
+		t.Fatal("matching Ravel version output was rejected")
+	}
+	if ravelVersionOutputMatches("ravel v1.2.2 (Ravel integrated node runtime)", "v1.2.3") {
+		t.Fatal("mismatched Ravel version output was accepted")
+	}
+}
+
+func TestCurrentRavelReleaseTargetUsesBuildArchitecture(t *testing.T) {
+	previousOS := runtimeGOOS
+	previousArch := runtimeGOARCH
+	previousSetting := readCurrentBuildSetting
+	t.Cleanup(func() {
+		runtimeGOOS = previousOS
+		runtimeGOARCH = previousArch
+		readCurrentBuildSetting = previousSetting
+	})
+
+	runtimeGOOS = "linux"
+	runtimeGOARCH = "arm"
+	readCurrentBuildSetting = func(name string) string {
+		if name == "GOARM" {
+			return "6"
+		}
+		return ""
+	}
+	target, err := currentRavelReleaseTarget()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.AssetName != "v2node-linux-arm32-v6.zip" || target.BinaryName != "v2node" {
+		t.Fatalf("unexpected ARM target: %+v", target)
+	}
+
+	runtimeGOARCH = "mipsle"
+	readCurrentBuildSetting = func(name string) string {
+		if name == "GOMIPS" {
+			return "softfloat"
+		}
+		return ""
+	}
+	target, err = currentRavelReleaseTarget()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.AssetName != "v2node-linux-mips32le.zip" || target.BinaryName != "v2node_softfloat" {
+		t.Fatalf("unexpected MIPS target: %+v", target)
 	}
 }
 

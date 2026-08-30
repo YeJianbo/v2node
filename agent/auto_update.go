@@ -4,14 +4,18 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -28,11 +32,26 @@ type AutoUpdateConfig struct {
 }
 
 type githubRelease struct {
-	TagName string `json:"tag_name"`
-	Assets  []struct {
-		Name               string `json:"name"`
-		BrowserDownloadURL string `json:"browser_download_url"`
-	} `json:"assets"`
+	TagName string        `json:"tag_name"`
+	Assets  []githubAsset `json:"assets"`
+}
+
+type githubAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+	Digest             string `json:"digest"`
+}
+
+type ravelReleaseTarget struct {
+	AssetName  string
+	BinaryName string
+}
+
+type PendingRavelUpdate struct {
+	PreviousVersion string `json:"previous_version"`
+	TargetVersion   string `json:"target_version"`
+	RequestID       string `json:"request_id,omitempty"`
+	CreatedAt       int64  `json:"created_at"`
 }
 
 func normalizeAutoUpdateConfig(config AutoUpdateConfig) AutoUpdateConfig {
@@ -69,7 +88,7 @@ func CheckAndInstallRavelUpdate(ctx context.Context, config AutoUpdateConfig, cu
 	if semver.Compare(release.TagName, currentVersion) <= 0 {
 		return release.TagName, false, nil
 	}
-	if err := installRavelRelease(ctx, release, binaryPath); err != nil {
+	if err := installRavelRelease(ctx, release, binaryPath, currentVersion, ""); err != nil {
 		return release.TagName, false, err
 	}
 	return release.TagName, true, nil
@@ -93,7 +112,7 @@ func CheckAndInstallRequestedRavelUpdate(ctx context.Context, config AutoUpdateC
 	if strings.TrimSpace(currentVersion) == release.TagName {
 		return release.TagName, false, nil
 	}
-	if err := installRavelRelease(ctx, release, binaryPath); err != nil {
+	if err := installRavelRelease(ctx, release, binaryPath, currentVersion, config.RequestID); err != nil {
 		return release.TagName, false, err
 	}
 	return release.TagName, true, nil
@@ -125,37 +144,69 @@ func fetchGitHubRelease(ctx context.Context, repo, targetVersion string) (github
 	return release, nil
 }
 
-func installRavelRelease(ctx context.Context, release githubRelease, binaryPath string) error {
-	assetName, err := ravelReleaseAssetName()
+func installRavelRelease(ctx context.Context, release githubRelease, binaryPath, currentVersion, requestID string) error {
+	pending, err := LoadPendingRavelUpdate(binaryPath)
+	if err == nil {
+		if pending.TargetVersion == release.TagName {
+			return nil
+		}
+		return fmt.Errorf("Ravel update to %s is still pending restart", pending.TargetVersion)
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("read pending Ravel update state: %w", err)
+	}
+
+	target, err := currentRavelReleaseTarget()
 	if err != nil {
 		return err
 	}
-	assetURL := ""
+	var selected githubAsset
 	for _, asset := range release.Assets {
-		if asset.Name == assetName {
-			assetURL = asset.BrowserDownloadURL
+		if asset.Name == target.AssetName {
+			selected = asset
 			break
 		}
 	}
-	if assetURL == "" {
-		return fmt.Errorf("release asset %s was not found", assetName)
+	if selected.BrowserDownloadURL == "" {
+		return fmt.Errorf("release asset %s was not found", target.AssetName)
 	}
 
-	archive, err := downloadUpdateAsset(ctx, assetURL)
+	archive, err := downloadUpdateAsset(ctx, selected.BrowserDownloadURL)
 	if err != nil {
 		return err
 	}
-	if err := replaceRavelBinary(binaryPath, archive); err != nil {
+	digest, err := resolveReleaseAssetDigest(ctx, release, selected)
+	if err != nil {
 		return err
+	}
+	if err := verifyReleaseAssetDigest(archive, digest); err != nil {
+		return err
+	}
+	if err := replaceRavelBinaryEntry(binaryPath, archive, target.BinaryName, func(path string) error {
+		return validateRavelBinary(path, release.TagName)
+	}); err != nil {
+		return err
+	}
+	if err := writePendingRavelUpdate(binaryPath, PendingRavelUpdate{
+		PreviousVersion: currentVersion,
+		TargetVersion:   release.TagName,
+		RequestID:       requestID,
+		CreatedAt:       time.Now().Unix(),
+	}); err != nil {
+		_ = RestorePreviousRavelBinary(binaryPath)
+		return fmt.Errorf("write pending update state: %w", err)
 	}
 	return nil
 }
 
-func ravelReleaseAssetName() (string, error) {
+var runtimeGOOS = runtime.GOOS
+var runtimeGOARCH = runtime.GOARCH
+var readCurrentBuildSetting = currentBuildSetting
+
+func currentRavelReleaseTarget() (ravelReleaseTarget, error) {
 	arch := map[string]string{
 		"386":      "32",
 		"amd64":    "64",
-		"arm":      "arm32-v7a",
 		"arm64":    "arm64-v8a",
 		"mips":     "mips32",
 		"mipsle":   "mips32le",
@@ -165,11 +216,44 @@ func ravelReleaseAssetName() (string, error) {
 		"ppc64le":  "ppc64le",
 		"riscv64":  "riscv64",
 		"s390x":    "s390x",
-	}[runtime.GOARCH]
-	if arch == "" || runtime.GOOS != "linux" {
-		return "", fmt.Errorf("Ravel auto update does not support %s/%s", runtime.GOOS, runtime.GOARCH)
+	}[runtimeGOARCH]
+	binaryName := "v2node"
+	if runtimeGOARCH == "arm" {
+		goarm := readCurrentBuildSetting("GOARM")
+		switch {
+		case strings.HasPrefix(goarm, "5"):
+			arch = "arm32-v5"
+		case strings.HasPrefix(goarm, "6"):
+			arch = "arm32-v6"
+		default:
+			arch = "arm32-v7a"
+		}
 	}
-	return "v2node-linux-" + arch + ".zip", nil
+	if (runtimeGOARCH == "mips" || runtimeGOARCH == "mipsle") && readCurrentBuildSetting("GOMIPS") == "softfloat" {
+		binaryName = "v2node_softfloat"
+	}
+	if arch == "" || runtimeGOOS != "linux" {
+		return ravelReleaseTarget{}, fmt.Errorf("Ravel auto update does not support %s/%s", runtimeGOOS, runtimeGOARCH)
+	}
+	return ravelReleaseTarget{AssetName: "v2node-linux-" + arch + ".zip", BinaryName: binaryName}, nil
+}
+
+func ravelReleaseAssetName() (string, error) {
+	target, err := currentRavelReleaseTarget()
+	return target.AssetName, err
+}
+
+func currentBuildSetting(name string) string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == name {
+			return setting.Value
+		}
+	}
+	return ""
 }
 
 func downloadUpdateAsset(ctx context.Context, url string) ([]byte, error) {
@@ -189,20 +273,62 @@ func downloadUpdateAsset(ctx context.Context, url string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(response.Body, 128<<20))
 }
 
+func resolveReleaseAssetDigest(ctx context.Context, release githubRelease, asset githubAsset) (string, error) {
+	if strings.TrimSpace(asset.Digest) != "" {
+		return asset.Digest, nil
+	}
+	for _, candidate := range release.Assets {
+		if candidate.Name != asset.Name+".dgst" || candidate.BrowserDownloadURL == "" {
+			continue
+		}
+		raw, err := downloadUpdateAsset(ctx, candidate.BrowserDownloadURL)
+		if err != nil {
+			return "", err
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "SHA2-256") {
+				return "sha256:" + strings.TrimSpace(parts[1]), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("release asset %s does not provide a SHA-256 digest", asset.Name)
+}
+
+func verifyReleaseAssetDigest(data []byte, digest string) error {
+	algorithm, expected, ok := strings.Cut(strings.TrimSpace(digest), ":")
+	if !ok || !strings.EqualFold(algorithm, "sha256") {
+		return fmt.Errorf("unsupported release digest %q", digest)
+	}
+	expectedBytes, err := hex.DecodeString(strings.TrimSpace(expected))
+	if err != nil || len(expectedBytes) != sha256.Size {
+		return fmt.Errorf("invalid SHA-256 release digest %q", digest)
+	}
+	actual := sha256.Sum256(data)
+	if !bytes.Equal(actual[:], expectedBytes) {
+		return fmt.Errorf("release asset checksum mismatch: expected %s, got %s", expected, hex.EncodeToString(actual[:]))
+	}
+	return nil
+}
+
 func replaceRavelBinary(binaryPath string, archive []byte) error {
+	return replaceRavelBinaryEntry(binaryPath, archive, "v2node", nil)
+}
+
+func replaceRavelBinaryEntry(binaryPath string, archive []byte, binaryName string, validator func(string) error) error {
 	reader, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
 	if err != nil {
 		return fmt.Errorf("open release archive: %w", err)
 	}
 	var binary *zip.File
 	for _, entry := range reader.File {
-		if filepath.Base(entry.Name) == "v2node" && !entry.FileInfo().IsDir() {
+		if filepath.Base(entry.Name) == binaryName && !entry.FileInfo().IsDir() {
 			binary = entry
 			break
 		}
 	}
 	if binary == nil {
-		return fmt.Errorf("release archive does not contain v2node")
+		return fmt.Errorf("release archive does not contain %s", binaryName)
 	}
 
 	source, err := binary.Open()
@@ -231,6 +357,11 @@ func replaceRavelBinary(binaryPath string, archive []byte) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
+	if validator != nil {
+		if err := validator(temporaryPath); err != nil {
+			return fmt.Errorf("validate new Ravel binary: %w", err)
+		}
+	}
 
 	backupPath := binaryPath + ".previous"
 	_ = os.Remove(backupPath)
@@ -241,5 +372,85 @@ func replaceRavelBinary(binaryPath string, archive []byte) error {
 		_ = os.Rename(backupPath, binaryPath)
 		return fmt.Errorf("activate Ravel update: %w", err)
 	}
+	return nil
+}
+
+func validateRavelBinary(path, expectedVersion string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, path, "version").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+	}
+	outputText := strings.TrimSpace(string(output))
+	if !strings.Contains(strings.ToLower(outputText), "ravel") || !ravelVersionOutputMatches(outputText, expectedVersion) {
+		return fmt.Errorf("unexpected version output %q, expected %s", outputText, expectedVersion)
+	}
+	return nil
+}
+
+func ravelVersionOutputMatches(output, expectedVersion string) bool {
+	expectedVersion = strings.TrimSpace(expectedVersion)
+	if expectedVersion == "" {
+		return false
+	}
+	for _, field := range strings.Fields(output) {
+		if strings.Trim(field, "()[]{}") == expectedVersion {
+			return true
+		}
+	}
+	return false
+}
+
+func pendingRavelUpdatePath(binaryPath string) string {
+	return binaryPath + ".update-pending.json"
+}
+
+func writePendingRavelUpdate(binaryPath string, state PendingRavelUpdate) error {
+	raw, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	return atomicWrite(pendingRavelUpdatePath(binaryPath), append(raw, '\n'), 0o600)
+}
+
+func LoadPendingRavelUpdate(binaryPath string) (PendingRavelUpdate, error) {
+	var state PendingRavelUpdate
+	raw, err := os.ReadFile(pendingRavelUpdatePath(binaryPath))
+	if err != nil {
+		return state, err
+	}
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return state, err
+	}
+	return state, nil
+}
+
+func CompletePendingRavelUpdate(binaryPath string) error {
+	if err := os.Remove(pendingRavelUpdatePath(binaryPath)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(binaryPath + ".previous"); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func RestorePreviousRavelBinary(binaryPath string) error {
+	backupPath := binaryPath + ".previous"
+	if _, err := os.Stat(backupPath); err != nil {
+		return err
+	}
+	failedPath := binaryPath + ".failed"
+	_ = os.Remove(failedPath)
+	if err := os.Rename(binaryPath, failedPath); err != nil {
+		return err
+	}
+	if err := os.Rename(backupPath, binaryPath); err != nil {
+		_ = os.Rename(failedPath, binaryPath)
+		return err
+	}
+	_ = os.Remove(failedPath)
+	_ = os.Remove(pendingRavelUpdatePath(binaryPath))
 	return nil
 }

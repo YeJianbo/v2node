@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/wyx2685/v2node/common/crypt"
+	"github.com/wyx2685/v2node/node"
 )
 
 const configPath = "/api/v1/server/machine/v2nodeConfig"
@@ -28,16 +31,27 @@ type NodeConfig struct {
 }
 
 type ConfigResponse struct {
-	Data               []NodeConfig `json:"data"`
-	RestartToken       string       `json:"restart_node_token"`
-	LegacyRestartToken string       `json:"restart_v2node_token"`
-	Probe              ProbeConfig  `json:"probe"`
+	Data               *[]NodeConfig `json:"data"`
+	ConfigRevision     string        `json:"config_revision"`
+	ConfigSchema       int           `json:"config_schema"`
+	Authoritative      bool          `json:"authoritative"`
+	RestartToken       string        `json:"restart_node_token"`
+	LegacyRestartToken string        `json:"restart_v2node_token"`
+	Probe              *ProbeConfig  `json:"probe"`
 }
 
 type ProbeConfig struct {
 	AutoUpdate     AutoUpdateConfig     `json:"auto_update"`
-	Relay          RelayConfig          `json:"relay"`
+	Relay          *RelayConfig         `json:"relay"`
 	NetworkQuality NetworkQualityConfig `json:"network_quality"`
+}
+
+type ConfigApplyState struct {
+	DesiredRevision string `json:"desired_revision"`
+	AppliedRevision string `json:"applied_revision"`
+	Status          string `json:"status"`
+	Error           string `json:"error,omitempty"`
+	UpdatedAt       int64  `json:"updated_at"`
 }
 
 type Controller struct {
@@ -50,6 +64,8 @@ type Controller struct {
 	quality     NetworkQualityConfig
 	updateMu    sync.RWMutex
 	autoUpdate  AutoUpdateConfig
+	applyMu     sync.RWMutex
+	applyState  ConfigApplyState
 }
 
 func LoadState(path string) (State, error) {
@@ -79,14 +95,34 @@ func (c *Controller) Sync() (bool, int, error) {
 	if err := c.Client.Get(configPath, query, &response); err != nil {
 		return false, 0, err
 	}
+	if response.Data == nil {
+		return false, 0, fmt.Errorf("panel response omitted managed node data")
+	}
+	if response.Probe == nil || response.Probe.Relay == nil {
+		return false, len(*response.Data), fmt.Errorf("panel response omitted relay configuration")
+	}
+	desired := *response.Data
+	revision := strings.TrimSpace(response.ConfigRevision)
+	if revision == "" {
+		revision = configRevision(desired, *response.Probe.Relay)
+	}
+	revisionChanged := c.setDesiredRevision(revision)
+
+	relayChanged := false
 	if c.Relay != nil {
-		_, _ = c.Relay.Sync(response.Probe.Relay)
+		var err error
+		relayChanged, err = c.Relay.Sync(*response.Probe.Relay)
+		if err != nil {
+			c.MarkConfigApply("failed", err.Error())
+			return false, len(desired), fmt.Errorf("apply relay configuration: %w", err)
+		}
 	}
 	c.setNetworkQualityConfig(response.Probe.NetworkQuality)
 	c.setAutoUpdateConfig(response.Probe.AutoUpdate)
-	changed, err := c.writeMergedConfig(response.Data)
+	nodeConfigChanged, err := c.writeMergedConfig(desired)
 	if err != nil {
-		return false, 0, err
+		c.MarkConfigApply("failed", err.Error())
+		return false, len(desired), err
 	}
 	restartToken := response.RestartToken
 	if restartToken == "" {
@@ -96,10 +132,199 @@ func (c *Controller) Sync() (bool, int, error) {
 	if restartRequested {
 		var ack map[string]any
 		if err := c.Client.Post(restartAckPath, map[string]string{"restart_token": restartToken}, &ack); err != nil {
-			return false, len(response.Data), fmt.Errorf("acknowledge restart: %w", err)
+			return false, len(desired), fmt.Errorf("acknowledge restart: %w", err)
 		}
 	}
-	return changed || restartRequested, len(response.Data), nil
+	state := c.currentApplyState()
+	if nodeConfigChanged || restartRequested || state.Status == "" {
+		c.MarkConfigApply("applying", "")
+	} else if relayChanged || revisionChanged {
+		if state.Status == "partial" {
+			c.MarkConfigApply("partial", state.Error)
+		} else {
+			c.MarkConfigApply("success", "")
+		}
+	}
+	return nodeConfigChanged || restartRequested, len(desired), nil
+}
+
+func configRevision(nodes []NodeConfig, relay RelayConfig) string {
+	raw, _ := json.Marshal(struct {
+		Nodes []NodeConfig `json:"nodes"`
+		Relay RelayConfig  `json:"relay"`
+	}{Nodes: nodes, Relay: relay})
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:])
+}
+
+func (c *Controller) applyStatePath() string {
+	if strings.TrimSpace(c.ManagedFile) == "" {
+		return ""
+	}
+	return c.ManagedFile + ".apply-state.json"
+}
+
+func (c *Controller) LoadApplyState() {
+	path := c.applyStatePath()
+	if path == "" {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var state ConfigApplyState
+	if json.Unmarshal(raw, &state) != nil {
+		return
+	}
+	c.applyMu.Lock()
+	c.applyState = state
+	c.applyMu.Unlock()
+}
+
+func (c *Controller) setDesiredRevision(revision string) bool {
+	revision = strings.TrimSpace(revision)
+	c.applyMu.Lock()
+	changed := c.applyState.DesiredRevision != revision
+	c.applyState.DesiredRevision = revision
+	c.applyMu.Unlock()
+	return changed
+}
+
+func (c *Controller) currentApplyState() ConfigApplyState {
+	c.applyMu.RLock()
+	state := c.applyState
+	c.applyMu.RUnlock()
+	return state
+}
+
+func (c *Controller) MarkConfigApply(status, message string) {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if status == "" {
+		status = "unknown"
+	}
+	c.applyMu.Lock()
+	c.applyState.Status = status
+	c.applyState.Error = truncateStatusMessage(message, 255)
+	c.applyState.UpdatedAt = time.Now().Unix()
+	if status == "success" || status == "partial" {
+		c.applyState.AppliedRevision = c.applyState.DesiredRevision
+	}
+	if status == "success" {
+		c.applyState.Error = ""
+	}
+	state := c.applyState
+	c.applyMu.Unlock()
+	c.persistApplyState(state)
+}
+
+func (c *Controller) ConfigStatus() map[string]any {
+	c.applyMu.RLock()
+	state := c.applyState
+	c.applyMu.RUnlock()
+	return map[string]any{
+		"config_desired_revision": state.DesiredRevision,
+		"config_applied_revision": state.AppliedRevision,
+		"config_apply_status":     state.Status,
+		"config_apply_error":      state.Error,
+		"config_apply_at":         state.UpdatedAt,
+	}
+}
+
+func (c *Controller) persistApplyState(state ConfigApplyState) {
+	path := c.applyStatePath()
+	if path == "" {
+		return
+	}
+	raw, err := json.MarshalIndent(state, "", "  ")
+	if err == nil {
+		_ = atomicWrite(path, append(raw, '\n'), 0o600)
+	}
+}
+
+func (c *Controller) LocalNodeCount() (int, error) {
+	raw, err := os.ReadFile(c.ConfigFile)
+	if err != nil {
+		return 0, err
+	}
+	plain, err := c.decrypt(raw)
+	if err != nil {
+		return 0, err
+	}
+	var config struct {
+		Nodes []NodeConfig `json:"Nodes"`
+	}
+	if err := json.Unmarshal(plain, &config); err != nil {
+		return 0, err
+	}
+	return len(config.Nodes), nil
+}
+
+func (c *Controller) LastGoodConfigPath() string {
+	return c.ConfigFile + ".last-good"
+}
+
+func (c *Controller) SaveLastGoodConfig() error {
+	raw, err := os.ReadFile(c.ConfigFile)
+	if err != nil {
+		return err
+	}
+	return atomicWrite(c.LastGoodConfigPath(), raw, 0o600)
+}
+
+func (c *Controller) RestoreLastGoodConfig() error {
+	raw, err := os.ReadFile(c.LastGoodConfigPath())
+	if err != nil {
+		return err
+	}
+	return atomicWrite(c.ConfigFile, raw, 0o600)
+}
+
+func (c *Controller) runtimeSnapshotPath() string {
+	if strings.TrimSpace(c.ManagedFile) == "" {
+		return ""
+	}
+	return c.ManagedFile + ".runtime-cache.enc.json"
+}
+
+func (c *Controller) LoadRuntimeSnapshot() (node.RuntimeSnapshot, error) {
+	var snapshot node.RuntimeSnapshot
+	path := c.runtimeSnapshotPath()
+	if path == "" {
+		return snapshot, os.ErrNotExist
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return snapshot, err
+	}
+	plain, err := c.decrypt(raw)
+	if err != nil {
+		return snapshot, err
+	}
+	if err := json.Unmarshal(plain, &snapshot); err != nil {
+		return snapshot, err
+	}
+	return snapshot, nil
+}
+
+func (c *Controller) SaveRuntimeSnapshot(snapshot node.RuntimeSnapshot) error {
+	path := c.runtimeSnapshotPath()
+	if path == "" {
+		return fmt.Errorf("runtime snapshot path is not configured")
+	}
+	plain, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+	key, err := c.readKey()
+	if err != nil {
+		return err
+	}
+	encrypted, err := crypt.EncryptConfig(plain, key)
+	if err != nil {
+		return err
+	}
+	return atomicWrite(path, encrypted, 0o600)
 }
 
 func (c *Controller) setAutoUpdateConfig(config AutoUpdateConfig) {
@@ -165,6 +390,9 @@ func (c *Controller) PushStatus(status map[string]any) error {
 		for key, value := range c.Relay.Status() {
 			status[key] = value
 		}
+	}
+	for key, value := range c.ConfigStatus() {
+		status[key] = value
 	}
 	var response map[string]any
 	return c.Client.Post(statusPath, status, &response)

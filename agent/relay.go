@@ -63,27 +63,27 @@ type RelayConfig struct {
 }
 
 type RelayRule struct {
-	ListenHost      string          `json:"listen_host"`
-	ListenHostAlt   string          `json:"listenHost"`
-	LocalHost       string          `json:"local_host"`
-	LocalHostAlt    string          `json:"localHost"`
-	ListenPort      flexiblePort    `json:"listen_port"`
-	ListenPortAlt   flexiblePort    `json:"listenPort"`
-	LocalPort       flexiblePort    `json:"local_port"`
-	LocalPortAlt    flexiblePort    `json:"localPort"`
-	TargetHost      string          `json:"target_host"`
-	TargetHostAlt   string          `json:"targetHost"`
-	RemoteHost      string          `json:"remote_host"`
-	RemoteHostAlt   string          `json:"remoteHost"`
-	Host            string          `json:"host"`
-	TargetPort      flexiblePort    `json:"target_port"`
-	TargetPortAlt   flexiblePort    `json:"targetPort"`
-	RemotePort      flexiblePort    `json:"remote_port"`
-	RemotePortAlt   flexiblePort    `json:"remotePort"`
-	Port            flexiblePort    `json:"port"`
-	Protocols       flexibleStrings `json:"protocols"`
-	Protocol        string          `json:"protocol"`
-	Type            string          `json:"type"`
+	ListenHost    string          `json:"listen_host"`
+	ListenHostAlt string          `json:"listenHost"`
+	LocalHost     string          `json:"local_host"`
+	LocalHostAlt  string          `json:"localHost"`
+	ListenPort    flexiblePort    `json:"listen_port"`
+	ListenPortAlt flexiblePort    `json:"listenPort"`
+	LocalPort     flexiblePort    `json:"local_port"`
+	LocalPortAlt  flexiblePort    `json:"localPort"`
+	TargetHost    string          `json:"target_host"`
+	TargetHostAlt string          `json:"targetHost"`
+	RemoteHost    string          `json:"remote_host"`
+	RemoteHostAlt string          `json:"remoteHost"`
+	Host          string          `json:"host"`
+	TargetPort    flexiblePort    `json:"target_port"`
+	TargetPortAlt flexiblePort    `json:"targetPort"`
+	RemotePort    flexiblePort    `json:"remote_port"`
+	RemotePortAlt flexiblePort    `json:"remotePort"`
+	Port          flexiblePort    `json:"port"`
+	Protocols     flexibleStrings `json:"protocols"`
+	Protocol      string          `json:"protocol"`
+	Type          string          `json:"type"`
 }
 
 type gostConfig struct {
@@ -115,7 +115,7 @@ func (m *RelayManager) Sync(config RelayConfig) (bool, error) {
 
 	if runtime.GOOS != "linux" {
 		m.lastError = "relay management is only supported on Linux"
-		return false, fmt.Errorf(m.lastError)
+		return false, fmt.Errorf("%s", m.lastError)
 	}
 	if !m.migrated {
 		m.cleanupLegacyLocked()
@@ -154,7 +154,10 @@ func (m *RelayManager) Sync(config RelayConfig) (bool, error) {
 		m.stopLocked()
 	}
 	if m.cmd == nil {
-		if err := m.startLocked(); err != nil {
+		if err := m.startAndVerifyLocked(); err != nil {
+			if changed {
+				m.restoreRelayConfigLocked(current)
+			}
 			m.lastError = err.Error()
 			return changed, err
 		}
@@ -162,6 +165,50 @@ func (m *RelayManager) Sync(config RelayConfig) (bool, error) {
 	m.ruleCount = len(nodes)
 	m.lastError = ""
 	return changed, nil
+}
+
+func (m *RelayManager) StartExisting() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cmd != nil && m.cmd.Process != nil {
+		if m.done == nil {
+			return nil
+		}
+		select {
+		case <-m.done:
+			m.cmd = nil
+			m.done = nil
+		default:
+			return nil
+		}
+	}
+
+	raw, err := os.ReadFile(m.ConfigPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var config gostConfig
+	if err := json.Unmarshal(raw, &config); err != nil {
+		return fmt.Errorf("decode existing relay configuration: %w", err)
+	}
+	if len(config.ServeNodes) == 0 {
+		return nil
+	}
+	if err := m.ensureBinaryLocked(); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	if err := m.startAndVerifyLocked(); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	m.ruleCount = len(config.ServeNodes)
+	m.lastError = ""
+	return nil
 }
 
 func (m *RelayManager) Status() map[string]any {
@@ -265,6 +312,39 @@ func (m *RelayManager) startLocked() error {
 	return nil
 }
 
+func (m *RelayManager) startAndVerifyLocked() error {
+	if err := m.startLocked(); err != nil {
+		return err
+	}
+	done := m.done
+	if done == nil {
+		return fmt.Errorf("GOST did not expose a process handle")
+	}
+	select {
+	case <-done:
+		m.cmd = nil
+		m.done = nil
+		return fmt.Errorf("GOST exited immediately; check relay ports and configuration")
+	case <-time.After(500 * time.Millisecond):
+		return nil
+	}
+}
+
+func (m *RelayManager) restoreRelayConfigLocked(previous []byte) {
+	m.stopLocked()
+	if len(previous) == 0 {
+		_ = os.Remove(m.ConfigPath)
+		return
+	}
+	if err := atomicWrite(m.ConfigPath, previous, 0o600); err != nil {
+		m.lastError = "restore previous relay configuration: " + err.Error()
+		return
+	}
+	if err := m.startAndVerifyLocked(); err != nil {
+		m.lastError = "restore previous relay process: " + err.Error()
+	}
+}
+
 func (m *RelayManager) stopLocked() {
 	if m.cmd == nil || m.cmd.Process == nil {
 		return
@@ -307,7 +387,7 @@ func (m *RelayManager) cleanupLegacyLocked() {
 
 func normalizeRelayRules(rules []RelayRule) []string {
 	nodes := make([]string, 0, len(rules)*2)
-	seen := map[string]bool{}
+	seenListeners := map[string]bool{}
 	for _, rule := range rules {
 		listenHost := firstString(rule.ListenHost, rule.ListenHostAlt, rule.LocalHost, rule.LocalHostAlt, "0.0.0.0")
 		targetHost := firstString(rule.TargetHost, rule.TargetHostAlt, rule.RemoteHost, rule.RemoteHostAlt, rule.Host)
@@ -325,9 +405,10 @@ func normalizeRelayRules(rules []RelayRule) []string {
 			if listenHost != "" && listenHost != "0.0.0.0" && listenHost != "::" {
 				listenAddress = net.JoinHostPort(strings.Trim(listenHost, "[]"), strconv.Itoa(listenPort))
 			}
-			node := protocol + "://" + listenAddress + "/" + net.JoinHostPort(strings.Trim(targetHost, "[]"), strconv.Itoa(targetPort))
-			if !seen[node] {
-				seen[node] = true
+			listener := protocol + "://" + listenAddress
+			node := listener + "/" + net.JoinHostPort(strings.Trim(targetHost, "[]"), strconv.Itoa(targetPort))
+			if !seenListeners[listener] {
+				seenListeners[listener] = true
 				nodes = append(nodes, node)
 			}
 		}

@@ -51,19 +51,91 @@ func ravelHandle(_ *cobra.Command, _ []string) {
 		ManagedFile: ravelManagedFile,
 		Relay:       agent.NewRelayManager("/usr/local/ravel/gost", "/etc/.buncloud-agent/relay.json"),
 	}
+	controller.LoadApplyState()
+	snapshot, snapshotErr := controller.LoadRuntimeSnapshot()
+	if snapshotErr != nil && !os.IsNotExist(snapshotErr) {
+		log.WithError(snapshotErr).Warn("load cached Ravel runtime data failed")
+	}
 	changed, nodeCount, err := controller.Sync()
 	if err != nil {
-		log.WithError(err).Fatal("initial Ravel sync failed")
+		log.WithError(err).Warn("initial Ravel sync failed; starting from the last local runtime state")
+		nodeCount, err = controller.LocalNodeCount()
+		if err != nil {
+			log.WithError(err).Warn("current local Ravel configuration is unusable; restoring last-good configuration")
+			if restoreErr := controller.RestoreLastGoodConfig(); restoreErr != nil {
+				log.WithError(restoreErr).Fatal("no usable local Ravel configuration")
+			}
+			nodeCount, err = controller.LocalNodeCount()
+			if err != nil {
+				log.WithError(err).Fatal("restored last-good Ravel configuration is unusable")
+			}
+		}
+		if relayErr := controller.Relay.StartExisting(); relayErr != nil {
+			log.WithError(relayErr).Warn("start cached relay configuration failed")
+		}
+	} else {
+		log.Infof("Ravel synchronized %d managed nodes", nodeCount)
 	}
 	_ = changed
-	log.Infof("Ravel synchronized %d managed nodes", nodeCount)
 
 	reloadCh := make(chan struct{}, 1)
-	go runRavelLoop(controller, state, reloadCh, nodeCount)
-	runServer(ravelConfigFile, reloadCh, false)
+	var runtimeReady atomic.Bool
+	binaryPath, binaryPathErr := os.Executable()
+	if binaryPathErr != nil {
+		log.WithError(binaryPathErr).Warn("resolve Ravel executable failed")
+	}
+	var pendingUpdate agent.PendingRavelUpdate
+	if binaryPathErr == nil {
+		loadedUpdate, loadErr := agent.LoadPendingRavelUpdate(binaryPath)
+		pendingUpdate = loadedUpdate
+		if loadErr != nil && !os.IsNotExist(loadErr) {
+			log.WithError(loadErr).Warn("load pending Ravel update state failed")
+		}
+	}
+	go runRavelLoop(controller, state, reloadCh, nodeCount, &runtimeReady)
+	err = runServerWithApply(
+		ravelConfigFile,
+		reloadCh,
+		false,
+		controller.LastGoodConfigPath(),
+		snapshot,
+		func(report runtimeApplyReport) {
+			runtimeReady.Store(report.ActiveNodes > 0 || report.RequestedNodes == 0)
+			controller.MarkConfigApply(report.Status, report.Error)
+			if runtimeReady.Load() && pendingUpdate.TargetVersion == version && binaryPathErr == nil {
+				if err := agent.CompletePendingRavelUpdate(binaryPath); err != nil {
+					log.WithError(err).Warn("complete pending Ravel update failed")
+				} else {
+					pendingUpdate = agent.PendingRavelUpdate{}
+				}
+			}
+			if report.Status == "success" || report.Status == "partial" {
+				if err := controller.SaveRuntimeSnapshot(report.Snapshot); err != nil {
+					log.WithError(err).Warn("save cached Ravel runtime data failed")
+				}
+			}
+			if report.Status == "success" {
+				if err := controller.SaveLastGoodConfig(); err != nil {
+					log.WithError(err).Warn("save last-good Ravel configuration failed")
+				}
+			}
+		},
+	)
+	if err != nil {
+		log.WithError(err).Error("Ravel runtime stopped")
+		if pendingUpdate.TargetVersion == version && binaryPathErr == nil {
+			if rollbackErr := agent.RestorePreviousRavelBinary(binaryPath); rollbackErr != nil {
+				log.WithError(rollbackErr).Error("restore previous Ravel binary failed")
+				return
+			}
+			if restartErr := scheduleRavelRestart(); restartErr != nil {
+				log.WithError(restartErr).Error("restart previous Ravel binary failed")
+			}
+		}
+	}
 }
 
-func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan<- struct{}, nodeCount int) {
+func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan<- struct{}, nodeCount int, runtimeReady *atomic.Bool) {
 	syncTicker := time.NewTicker(time.Duration(state.SyncInterval) * time.Second)
 	statusTicker := time.NewTicker(time.Duration(state.StatusInterval) * time.Second)
 	defer syncTicker.Stop()
@@ -102,6 +174,9 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 		}()
 	}
 	maybeRunAutoUpdate := func() {
+		if runtimeReady != nil && !runtimeReady.Load() {
+			return
+		}
 		config := controller.AutoUpdateConfig()
 		if config.RequestID != "" {
 			if !updateRunning.CompareAndSwap(false, true) {
@@ -123,28 +198,40 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 					currentVersion,
 					binaryPath,
 				)
-				status := "success"
-				installedVersion := currentVersion
-				message := ""
 				if updateErr != nil {
-					status = "failed"
-					message = updateErr.Error()
 					log.WithError(updateErr).Warn("Ravel manual update failed")
-				} else if target != "" {
-					installedVersion = target
-					currentUpdateVersion.Store(target)
+					if err := controller.AcknowledgeUpdate(request, "failed", currentVersion, updateErr.Error()); err != nil {
+						log.WithError(err).Warn("acknowledge Ravel manual update failure failed")
+					} else {
+						controller.ClearUpdateRequest(request.RequestID)
+					}
+					return
 				}
-				if err := controller.AcknowledgeUpdate(request, status, installedVersion, message); err != nil {
-					log.WithError(err).Warn("acknowledge Ravel manual update failed")
-				} else {
-					controller.ClearUpdateRequest(request.RequestID)
-				}
-				if updateErr != nil || !updated {
+				if !updated {
+					installedVersion := currentVersion
+					if target != "" {
+						installedVersion = target
+					}
+					if err := controller.AcknowledgeUpdate(request, "success", installedVersion, ""); err != nil {
+						log.WithError(err).Warn("acknowledge Ravel manual update failed")
+					} else {
+						controller.ClearUpdateRequest(request.RequestID)
+					}
 					return
 				}
 				log.Infof("Ravel manually updated from %s to %s; scheduling service restart", currentVersion, target)
 				if err := scheduleRavelRestart(); err != nil {
 					log.WithError(err).Error("schedule Ravel restart failed")
+					rollbackErr := agent.RestorePreviousRavelBinary(binaryPath)
+					message := err.Error()
+					if rollbackErr != nil {
+						message += "; rollback failed: " + rollbackErr.Error()
+					}
+					if ackErr := controller.AcknowledgeUpdate(request, "failed", currentVersion, message); ackErr != nil {
+						log.WithError(ackErr).Warn("acknowledge Ravel restart failure failed")
+					} else {
+						controller.ClearUpdateRequest(request.RequestID)
+					}
 				}
 			}(config)
 			return
@@ -179,10 +266,12 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 				log.Debugf("Ravel is current at %s", latest)
 				return
 			}
-			currentUpdateVersion.Store(latest)
 			log.Infof("Ravel updated from %s to %s; scheduling service restart", currentVersion, latest)
 			if err := scheduleRavelRestart(); err != nil {
 				log.WithError(err).Error("schedule Ravel restart failed")
+				if rollbackErr := agent.RestorePreviousRavelBinary(binaryPath); rollbackErr != nil {
+					log.WithError(rollbackErr).Error("restore previous Ravel binary failed")
+				}
 			}
 		}()
 	}
