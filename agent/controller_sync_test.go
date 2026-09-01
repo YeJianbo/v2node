@@ -99,6 +99,10 @@ func TestSyncDoesNotTurnFailedRevisionIntoSuccess(t *testing.T) {
 	if err := os.WriteFile(controller.ManagedFile, []byte(`["1"]`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	managedBefore, err := os.Stat(controller.ManagedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
 	controller.setDesiredRevision("revision-1")
 	controller.MarkConfigApply("failed", "port conflict")
 
@@ -108,6 +112,13 @@ func TestSyncDoesNotTurnFailedRevisionIntoSuccess(t *testing.T) {
 	}
 	if changed {
 		t.Fatal("unchanged failed revision unexpectedly requested a reload")
+	}
+	managedAfter, err := os.Stat(controller.ManagedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(managedBefore, managedAfter) {
+		t.Fatal("unchanged managed node state was rewritten")
 	}
 	state := controller.currentApplyState()
 	if state.Status != "failed" || state.Error != "port conflict" {

@@ -290,6 +290,15 @@ func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan
 				default:
 				}
 			}
+			if err := controller.ProcessRuntimeTask(func() error {
+				select {
+				case reloadCh <- struct{}{}:
+				default:
+				}
+				return nil
+			}); err != nil {
+				log.WithError(err).Warn("Ravel runtime task failed")
+			}
 		case <-statusTicker.C:
 			if err := controller.PushStatus(agent.CollectStatus(nodeCount)); err != nil {
 				log.WithError(err).Warn("Ravel status report failed")

@@ -20,6 +20,11 @@ var cpuState struct {
 	previous cpuCounters
 }
 
+var (
+	staticStatusOnce sync.Once
+	staticStatus     map[string]any
+)
+
 var runtimeVersion = "unknown"
 
 func SetRuntimeVersion(version string) {
@@ -30,26 +35,37 @@ func SetRuntimeVersion(version string) {
 }
 
 func CollectStatus(nodeCount int) map[string]any {
-	hostname, _ := os.Hostname()
-	status := map[string]any{
-		"version":       "ravel " + runtimeVersion,
-		"ravel_version": runtimeVersion,
-		"hostname":      hostname,
-		"os":            readOSName(),
-		"kernel":        readTrimmedFile("/proc/sys/kernel/osrelease"),
-		"arch":          runtime.GOARCH,
-		"cpu_cores":     runtime.NumCPU(),
-		"cpu_model":     readCPUModel(),
-		"managed_nodes": nodeCount,
-		"v2node_status": "active",
-		"process_count": readProcessCount(),
-		"updated_at":    time.Now().Unix(),
-	}
+	status := collectStaticStatus()
+	status["version"] = "ravel " + runtimeVersion
+	status["ravel_version"] = runtimeVersion
+	status["managed_nodes"] = nodeCount
+	status["v2node_status"] = "active"
+	status["process_count"] = readProcessCount()
+	status["updated_at"] = time.Now().Unix()
 	status["cpu"] = readCPUPercent()
 	readUptimeAndLoad(status)
 	readMemory(status)
 	readDisk(status)
 	readNetwork(status)
+	return status
+}
+
+func collectStaticStatus() map[string]any {
+	staticStatusOnce.Do(func() {
+		hostname, _ := os.Hostname()
+		staticStatus = map[string]any{
+			"hostname":  hostname,
+			"os":        readOSName(),
+			"kernel":    readTrimmedFile("/proc/sys/kernel/osrelease"),
+			"arch":      runtime.GOARCH,
+			"cpu_cores": runtime.NumCPU(),
+			"cpu_model": readCPUModel(),
+		}
+	})
+	status := make(map[string]any, len(staticStatus)+16)
+	for key, value := range staticStatus {
+		status[key] = value
+	}
 	return status
 }
 

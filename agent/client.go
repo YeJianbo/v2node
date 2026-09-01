@@ -45,7 +45,17 @@ func NewClient(state State) (*Client, error) {
 		baseURL:   strings.TrimRight(state.PanelURL, "/"),
 		token:     state.MachineToken,
 		machineID: state.MachineID,
-		http:      &http.Client{Timeout: 30 * time.Second},
+		http: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				MaxIdleConns:          8,
+				MaxIdleConnsPerHost:   4,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 20 * time.Second,
+			},
+		},
 	}, nil
 }
 

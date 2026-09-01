@@ -44,6 +44,7 @@ type ProbeConfig struct {
 	AutoUpdate     AutoUpdateConfig     `json:"auto_update"`
 	Relay          *RelayConfig         `json:"relay"`
 	NetworkQuality NetworkQualityConfig `json:"network_quality"`
+	RuntimeTask    *RuntimeTask         `json:"runtime_task"`
 }
 
 type ConfigApplyState struct {
@@ -66,6 +67,8 @@ type Controller struct {
 	autoUpdate  AutoUpdateConfig
 	applyMu     sync.RWMutex
 	applyState  ConfigApplyState
+	runtimeMu   sync.RWMutex
+	runtimeTask *RuntimeTask
 }
 
 func LoadState(path string) (State, error) {
@@ -119,6 +122,7 @@ func (c *Controller) Sync() (bool, int, error) {
 	}
 	c.setNetworkQualityConfig(response.Probe.NetworkQuality)
 	c.setAutoUpdateConfig(response.Probe.AutoUpdate)
+	c.setRuntimeTask(response.Probe.RuntimeTask)
 	nodeConfigChanged, err := c.writeMergedConfig(desired)
 	if err != nil {
 		c.MarkConfigApply("failed", err.Error())
@@ -155,6 +159,27 @@ func configRevision(nodes []NodeConfig, relay RelayConfig) string {
 	}{Nodes: nodes, Relay: relay})
 	digest := sha256.Sum256(raw)
 	return hex.EncodeToString(digest[:])
+}
+
+func (c *Controller) setRuntimeTask(task *RuntimeTask) {
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+	if task == nil {
+		c.runtimeTask = nil
+		return
+	}
+	copyTask := *task
+	c.runtimeTask = &copyTask
+}
+
+func (c *Controller) RuntimeTask() *RuntimeTask {
+	c.runtimeMu.RLock()
+	defer c.runtimeMu.RUnlock()
+	if c.runtimeTask == nil {
+		return nil
+	}
+	copyTask := *c.runtimeTask
+	return &copyTask
 }
 
 func (c *Controller) applyStatePath() string {
@@ -482,8 +507,14 @@ func (c *Controller) writeMergedConfig(desired []NodeConfig) (bool, error) {
 		}
 	}
 	managedRaw, _ := json.MarshalIndent(managedIdentities, "", "  ")
-	if err := atomicWrite(c.ManagedFile, managedRaw, 0o600); err != nil {
-		return false, err
+	managedChanged := true
+	if current, err := os.ReadFile(c.ManagedFile); err == nil {
+		managedChanged = !jsonEqual(current, managedRaw)
+	}
+	if managedChanged {
+		if err := atomicWrite(c.ManagedFile, managedRaw, 0o600); err != nil {
+			return false, err
+		}
 	}
 	return changed, nil
 }

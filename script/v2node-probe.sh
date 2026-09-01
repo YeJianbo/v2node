@@ -29,6 +29,7 @@ MANAGED_NODES_STATE_FILE="${V2NODE_PROBE_MANAGED_NODES_STATE_FILE:-${CONFIG_DIR}
 DDNS_STATE_FILE="${V2NODE_PROBE_DDNS_STATE_FILE:-${CONFIG_DIR}/ddns.json}"
 UPDATE_STATE_FILE="${V2NODE_PROBE_UPDATE_STATE_FILE:-${CONFIG_DIR}/update.json}"
 NETWORK_QUALITY_STATE_FILE="${V2NODE_PROBE_NETWORK_QUALITY_STATE_FILE:-${CONFIG_DIR}/network-quality.json}"
+RUNTIME_TASK_RESULT_FILE="${V2NODE_PROBE_RUNTIME_TASK_RESULT_FILE:-${CONFIG_DIR}/runtime-task-result.json}"
 if [[ -z "${V2NODE_PROBE_STATE_FILE:-}" && ! -f "$STATE_FILE" && -f "${CONFIG_DIR}/probe-state.json" ]]; then
     STATE_FILE="${CONFIG_DIR}/probe-state.json"
 fi
@@ -2294,6 +2295,129 @@ ack_connectivity_test() {
     signed_post_json "/api/v1/server/machine/connectivityTestAck" "$body" >/dev/null
 }
 
+ack_runtime_task() {
+    local result_file="$1"
+    signed_post_json "/api/v1/server/machine/runtimeTaskAck" "$(cat "$result_file")" >/dev/null
+}
+
+run_runtime_task() {
+    local task_json="$1"
+    local task_id service action lines expires_at unit output_file exit_code status message service_status
+    task_id=$(printf '%s' "$task_json" | jq -r '.task_id // ""')
+    service=$(printf '%s' "$task_json" | jq -r '.service // ""' | tr '[:upper:]' '[:lower:]')
+    action=$(printf '%s' "$task_json" | jq -r '.action // ""' | tr '[:upper:]' '[:lower:]')
+    lines=$(printf '%s' "$task_json" | jq -r '(.lines // 200) | tonumber')
+    expires_at=$(printf '%s' "$task_json" | jq -r '(.expires_at // 0) | tonumber')
+
+    [[ "$service" == "v2node" ]] && service="ravel"
+    if [[ -z "$task_id" || ( "$service" != "ravel" && "$service" != "gost" ) ]]; then
+        return 1
+    fi
+    if [[ -f "$RUNTIME_TASK_RESULT_FILE" ]] && [[ "$(jq -r '.task_id // ""' "$RUNTIME_TASK_RESULT_FILE" 2>/dev/null)" == "$task_id" ]]; then
+        ack_runtime_task "$RUNTIME_TASK_RESULT_FILE" || true
+        return 0
+    fi
+
+    [[ "$lines" -lt 50 || "$lines" -gt 300 ]] && lines=200
+    unit="gost.service"
+    if [[ "$service" == "ravel" ]]; then
+        if systemctl show ravel.service --property=LoadState --value 2>/dev/null | grep -qx loaded; then
+            unit="ravel.service"
+        else
+            unit="v2node.service"
+        fi
+    fi
+
+    output_file=$(mktemp)
+    exit_code=0
+    status="success"
+    message="运行任务执行成功"
+    if [[ "$expires_at" -gt 0 && "$expires_at" -le "$(date +%s)" ]]; then
+        status="failed"
+        exit_code=-1
+        message="运行任务已过期"
+    else
+        case "$action" in
+            logs)
+                if journalctl -u "$unit" -n "$lines" --no-pager -o short-iso >"$output_file" 2>&1; then
+                    message="已读取最近 ${lines} 行日志"
+                else
+                    exit_code=$?
+                    if [[ "$service" == "ravel" && -f /var/log/v2node.log ]]; then
+                        tail -n "$lines" /var/log/v2node.log >"$output_file" 2>&1 || true
+                        exit_code=0
+                    else
+                        status="failed"
+                        message="读取运行日志失败"
+                    fi
+                fi
+                ;;
+            status)
+                if systemctl show "$unit" --no-pager --property=ActiveState,SubState,Result,ExecMainStatus,ExecMainStartTimestamp >"$output_file" 2>&1; then
+                    message="服务状态读取完成"
+                else
+                    exit_code=$?
+                    status="failed"
+                    message="读取服务状态失败"
+                fi
+                ;;
+            reload|restart)
+                if [[ "$service" == "ravel" ]]; then
+                    if restart_v2node_service >"$output_file" 2>&1; then
+                        message="Ravel 重载完成"
+                    else
+                        exit_code=$?
+                        status="failed"
+                        message="Ravel 重载失败"
+                    fi
+                elif systemctl restart "$unit" >"$output_file" 2>&1; then
+                    message="GOST 重启完成"
+                else
+                    exit_code=$?
+                    status="failed"
+                    message="GOST 重启失败"
+                fi
+                ;;
+            start|stop)
+                if [[ "$service" != "gost" ]]; then
+                    exit_code=-1
+                    status="failed"
+                    message="控制进程不允许远程启动或停止"
+                elif systemctl "$action" "$unit" >"$output_file" 2>&1; then
+                    message="GOST ${action} 完成"
+                else
+                    exit_code=$?
+                    status="failed"
+                    message="GOST ${action} 失败"
+                fi
+                ;;
+            *)
+                exit_code=-1
+                status="failed"
+                message="不支持的运行操作"
+                ;;
+        esac
+    fi
+
+    service_status=$(systemctl is-active "$unit" 2>/dev/null || true)
+    ensure_private_dir "$CONFIG_DIR"
+    jq -nc \
+        --arg task_id "$task_id" \
+        --arg service "$service" \
+        --arg action "$action" \
+        --arg status "$status" \
+        --arg message "$message" \
+        --arg service_status "${service_status:-unknown}" \
+        --argjson exit_code "$exit_code" \
+        --arg logs "$(tail -c 32768 "$output_file" 2>/dev/null)" \
+        --argjson executed_at "$(date +%s)" \
+        '{task_id:$task_id,service:$service,action:$action,status:$status,message:$message,service_status:$service_status,exit_code:$exit_code,logs:$logs,executed_at:$executed_at}' \
+        >"$RUNTIME_TASK_RESULT_FILE"
+    chmod 600 "$RUNTIME_TASK_RESULT_FILE" >/dev/null 2>&1 || true
+    rm -f "$output_file"
+    ack_runtime_task "$RUNTIME_TASK_RESULT_FILE" || true
+}
+
 pick_free_tcp_port() {
     local port
     local try
@@ -2495,6 +2619,8 @@ sync_once() {
     relay_json=$(printf '%s' "$response" | jq -c '.probe.relay // {}')
     local connectivity_test_json
     connectivity_test_json=$(printf '%s' "$response" | jq -c '.probe.connectivity_test_task // null')
+    local runtime_task_json
+    runtime_task_json=$(printf '%s' "$response" | jq -c '.probe.runtime_task // null')
     local network_quality_json
     network_quality_json=$(printf '%s' "$response" | jq -c '.probe.network_quality // {enabled:false}')
     local combined_firewall_json
@@ -2576,6 +2702,9 @@ sync_once() {
     fi
     if [[ -n "$connectivity_test_json" && "$connectivity_test_json" != "null" ]]; then
         run_connectivity_test_task "$connectivity_test_json" || true
+    fi
+    if [[ -n "$runtime_task_json" && "$runtime_task_json" != "null" ]]; then
+        run_runtime_task "$runtime_task_json" || true
     fi
 
     if [[ "${CONFIG_CHANGED:-0}" == "1" ]]; then
