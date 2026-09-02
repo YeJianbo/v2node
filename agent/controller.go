@@ -56,19 +56,22 @@ type ConfigApplyState struct {
 }
 
 type Controller struct {
-	Client      *Client
-	ConfigFile  string
-	KeyFile     string
-	ManagedFile string
-	Relay       *RelayManager
-	qualityMu   sync.RWMutex
-	quality     NetworkQualityConfig
-	updateMu    sync.RWMutex
-	autoUpdate  AutoUpdateConfig
-	applyMu     sync.RWMutex
-	applyState  ConfigApplyState
-	runtimeMu   sync.RWMutex
-	runtimeTask *RuntimeTask
+	Client              *Client
+	ConfigFile          string
+	KeyFile             string
+	ManagedFile         string
+	Relay               *RelayManager
+	qualityMu           sync.RWMutex
+	quality             NetworkQualityConfig
+	updateMu            sync.RWMutex
+	autoUpdate          AutoUpdateConfig
+	applyMu             sync.RWMutex
+	applyState          ConfigApplyState
+	runtimeMu           sync.RWMutex
+	runtimeTask         *RuntimeTask
+	streamMu            sync.RWMutex
+	runtimeStream       *RuntimeStreamConfig
+	runtimeStreamCursor string
 }
 
 func LoadState(path string) (State, error) {
@@ -419,8 +422,19 @@ func (c *Controller) PushStatus(status map[string]any) error {
 	for key, value := range c.ConfigStatus() {
 		status[key] = value
 	}
-	var response map[string]any
-	return c.Client.Post(statusPath, status, &response)
+	streamChunk := c.collectRuntimeStream()
+	if streamChunk != nil {
+		status["runtime_stream"] = streamChunk
+	}
+	var response RuntimeStatusResponse
+	if err := c.Client.Post(statusPath, status, &response); err != nil {
+		return err
+	}
+	if streamChunk != nil {
+		c.acknowledgeRuntimeStream(streamChunk)
+	}
+	c.setRuntimeStream(response.RuntimeStream)
+	return nil
 }
 
 func (c *Controller) writeMergedConfig(desired []NodeConfig) (bool, error) {

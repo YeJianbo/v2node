@@ -51,3 +51,52 @@ func TestTailOutputKeepsNewestBytes(t *testing.T) {
 		t.Fatalf("tailOutput() = %q", got)
 	}
 }
+
+func TestParseRuntimeJournalOutputSeparatesCursor(t *testing.T) {
+	logs, cursor := parseRuntimeJournalOutput("first line\nsecond line\n-- cursor: s=abc;i=2\n")
+	if logs != "first line\nsecond line" {
+		t.Fatalf("unexpected logs: %q", logs)
+	}
+	if cursor != "s=abc;i=2" {
+		t.Fatalf("unexpected cursor: %q", cursor)
+	}
+}
+
+func TestTailRuntimeLogOutputStartsAtCompleteLine(t *testing.T) {
+	got := tailRuntimeLogOutput("first line\nsecond line\nthird line", 23)
+	if got != "second line\nthird line" {
+		t.Fatalf("unexpected log tail: %q", got)
+	}
+}
+
+func TestSetRuntimeStreamRejectsUnknownService(t *testing.T) {
+	controller := &Controller{}
+	controller.setRuntimeStream(&RuntimeStreamConfig{
+		SessionID: "stream-1",
+		Service:   "shell",
+		ExpiresAt: time.Now().Add(time.Minute).Unix(),
+	})
+	config, _ := controller.currentRuntimeStream()
+	if config != nil {
+		t.Fatalf("unknown service should not create a stream: %#v", config)
+	}
+}
+
+func TestSetRuntimeStreamResetsCursorForNewSession(t *testing.T) {
+	controller := &Controller{
+		runtimeStream:       &RuntimeStreamConfig{SessionID: "old", Service: "ravel"},
+		runtimeStreamCursor: "old-cursor",
+	}
+	controller.setRuntimeStream(&RuntimeStreamConfig{
+		SessionID: "new",
+		Service:   "gost",
+		ExpiresAt: time.Now().Add(time.Minute).Unix(),
+	})
+	config, cursor := controller.currentRuntimeStream()
+	if config == nil || config.SessionID != "new" || config.Service != "gost" {
+		t.Fatalf("unexpected stream config: %#v", config)
+	}
+	if cursor != "" {
+		t.Fatalf("cursor was not reset: %q", cursor)
+	}
+}

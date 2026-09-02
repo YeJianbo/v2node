@@ -14,9 +14,29 @@ import (
 )
 
 const (
-	runtimeAckPath   = "/api/v1/server/machine/runtimeTaskAck"
-	runtimeMaxOutput = 32 * 1024
+	runtimeAckPath        = "/api/v1/server/machine/runtimeTaskAck"
+	runtimeMaxOutput      = 32 * 1024
+	runtimeStreamMaxChunk = 8 * 1024
 )
+
+type RuntimeStatusResponse struct {
+	RuntimeStream *RuntimeStreamConfig `json:"runtime_stream"`
+}
+
+type RuntimeStreamConfig struct {
+	SessionID string `json:"session_id"`
+	Service   string `json:"service"`
+	ExpiresAt int64  `json:"expires_at"`
+}
+
+type RuntimeStreamChunk struct {
+	SessionID   string `json:"session_id"`
+	Service     string `json:"service"`
+	Logs        string `json:"logs,omitempty"`
+	Error       string `json:"error,omitempty"`
+	CollectedAt int64  `json:"collected_at"`
+	nextCursor  string
+}
 
 type RuntimeTask struct {
 	TaskID    string `json:"task_id"`
@@ -37,6 +57,112 @@ type RuntimeResult struct {
 	ExitCode      int    `json:"exit_code"`
 	Logs          string `json:"logs,omitempty"`
 	ExecutedAt    int64  `json:"executed_at"`
+}
+
+func (c *Controller) setRuntimeStream(config *RuntimeStreamConfig) {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	if config == nil || strings.TrimSpace(config.SessionID) == "" || config.ExpiresAt <= time.Now().Unix() {
+		c.runtimeStream = nil
+		c.runtimeStreamCursor = ""
+		return
+	}
+	normalizedService := normalizeRuntimeService(config.Service)
+	if normalizedService == "" {
+		c.runtimeStream = nil
+		c.runtimeStreamCursor = ""
+		return
+	}
+	if c.runtimeStream == nil || c.runtimeStream.SessionID != config.SessionID {
+		c.runtimeStreamCursor = ""
+	}
+	copyConfig := *config
+	copyConfig.Service = normalizedService
+	c.runtimeStream = &copyConfig
+}
+
+func (c *Controller) currentRuntimeStream() (*RuntimeStreamConfig, string) {
+	c.streamMu.RLock()
+	defer c.streamMu.RUnlock()
+	if c.runtimeStream == nil {
+		return nil, ""
+	}
+	copyConfig := *c.runtimeStream
+	return &copyConfig, c.runtimeStreamCursor
+}
+
+func (c *Controller) collectRuntimeStream() *RuntimeStreamChunk {
+	config, cursor := c.currentRuntimeStream()
+	if config == nil {
+		return nil
+	}
+	if config.ExpiresAt <= time.Now().Unix() {
+		c.setRuntimeStream(nil)
+		return nil
+	}
+
+	unit := runtimeServiceUnit(config.Service)
+	args := []string{"-u", unit, "--no-pager", "-o", "short-iso", "--show-cursor"}
+	if cursor == "" {
+		args = append(args, "-n", "80")
+	} else {
+		args = append(args, "--after-cursor", cursor)
+	}
+	output, _, err := runRuntimeCommand(5*time.Second, "journalctl", args...)
+	logs, nextCursor := parseRuntimeJournalOutput(output)
+	chunk := &RuntimeStreamChunk{
+		SessionID:   config.SessionID,
+		Service:     config.Service,
+		Logs:        tailRuntimeLogOutput(logs, runtimeStreamMaxChunk),
+		CollectedAt: time.Now().Unix(),
+		nextCursor:  nextCursor,
+	}
+	if err != nil {
+		chunk.Error = "读取实时日志失败: " + commandErrorMessage(err)
+		chunk.nextCursor = ""
+	}
+	return chunk
+}
+
+func (c *Controller) acknowledgeRuntimeStream(chunk *RuntimeStreamChunk) {
+	if chunk == nil || chunk.nextCursor == "" {
+		return
+	}
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	if c.runtimeStream != nil && c.runtimeStream.SessionID == chunk.SessionID {
+		c.runtimeStreamCursor = chunk.nextCursor
+	}
+}
+
+func parseRuntimeJournalOutput(output string) (string, string) {
+	lines := strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n")
+	logLines := make([]string, 0, len(lines))
+	cursor := ""
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "-- cursor:") {
+			cursor = strings.TrimSpace(strings.TrimPrefix(trimmed, "-- cursor:"))
+			continue
+		}
+		if trimmed == "-- No entries --" {
+			continue
+		}
+		logLines = append(logLines, line)
+	}
+	return strings.TrimSpace(strings.Join(logLines, "\n")), cursor
+}
+
+func tailRuntimeLogOutput(output string, limit int) string {
+	output = strings.TrimSpace(output)
+	if len(output) <= limit {
+		return output
+	}
+	tail := output[len(output)-limit:]
+	if newline := strings.IndexByte(tail, '\n'); newline >= 0 {
+		tail = tail[newline+1:]
+	}
+	return strings.TrimSpace(tail)
 }
 
 func (c *Controller) ProcessRuntimeTask(requestReload func() error) error {
