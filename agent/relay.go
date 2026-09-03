@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
@@ -18,7 +19,11 @@ import (
 	"time"
 )
 
-const gostVersion = "2.11.2"
+const (
+	gostVersion              = "2.11.2"
+	relayTargetProbeInterval = 30 * time.Second
+	relayTargetProbeTimeout  = 2 * time.Second
+)
 
 type flexiblePort int
 
@@ -92,21 +97,57 @@ type gostConfig struct {
 	ServeNodes []string `json:"ServeNodes"`
 }
 
+type relayListener struct {
+	Protocol   string
+	ListenHost string
+	ListenPort int
+	TargetHost string
+	TargetPort int
+}
+
+type relayTargetHealth struct {
+	Status    string
+	Message   string
+	CheckedAt int64
+}
+
+type RelayRuleHealth struct {
+	Protocol        string `json:"protocol"`
+	ListenHost      string `json:"listen_host"`
+	ListenPort      int    `json:"listen_port"`
+	Status          string `json:"status"`
+	ListenOK        bool   `json:"listen_ok"`
+	Message         string `json:"message"`
+	CheckedAt       int64  `json:"checked_at"`
+	TargetStatus    string `json:"target_status,omitempty"`
+	TargetOK        *bool  `json:"target_ok,omitempty"`
+	TargetMessage   string `json:"target_message,omitempty"`
+	TargetCheckedAt int64  `json:"target_checked_at,omitempty"`
+}
+
 type RelayManager struct {
 	BinaryPath string
 	ConfigPath string
 
-	mu        sync.Mutex
-	cmd       *exec.Cmd
-	done      chan struct{}
-	version   string
-	ruleCount int
-	lastError string
-	migrated  bool
+	mu                 sync.Mutex
+	cmd                *exec.Cmd
+	done               chan struct{}
+	version            string
+	ruleCount          int
+	lastError          string
+	migrated           bool
+	listeners          []relayListener
+	targetHealth       map[string]relayTargetHealth
+	targetProbeAt      time.Time
+	targetProbeRunning bool
 }
 
 func NewRelayManager(binaryPath, configPath string) *RelayManager {
-	return &RelayManager{BinaryPath: binaryPath, ConfigPath: configPath}
+	return &RelayManager{
+		BinaryPath:   binaryPath,
+		ConfigPath:   configPath,
+		targetHealth: make(map[string]relayTargetHealth),
+	}
 }
 
 func (m *RelayManager) Sync(config RelayConfig) (bool, error) {
@@ -130,6 +171,7 @@ func (m *RelayManager) Sync(config RelayConfig) (bool, error) {
 			changed = true
 		}
 		m.ruleCount = 0
+		m.listeners = nil
 		m.lastError = ""
 		return changed, nil
 	}
@@ -163,6 +205,7 @@ func (m *RelayManager) Sync(config RelayConfig) (bool, error) {
 		}
 	}
 	m.ruleCount = len(nodes)
+	m.listeners = relayListenersFromNodes(nodes)
 	m.lastError = ""
 	return changed, nil
 }
@@ -207,6 +250,7 @@ func (m *RelayManager) StartExisting() error {
 		return err
 	}
 	m.ruleCount = len(config.ServeNodes)
+	m.listeners = relayListenersFromNodes(config.ServeNodes)
 	m.lastError = ""
 	return nil
 }
@@ -220,12 +264,139 @@ func (m *RelayManager) Status() map[string]any {
 	} else if m.lastError != "" {
 		status = "failed"
 	}
+	m.scheduleTargetProbesLocked(status)
 	return map[string]any{
-		"gost_status":     status,
-		"gost_version":    m.version,
-		"gost_rule_count": m.ruleCount,
-		"gost_error":      m.lastError,
+		"gost_status":      status,
+		"gost_version":     m.version,
+		"gost_rule_count":  m.ruleCount,
+		"gost_error":       m.lastError,
+		"gost_rule_health": m.ruleHealthLocked(status),
 	}
+}
+
+func (m *RelayManager) ruleHealthLocked(status string) []RelayRuleHealth {
+	if len(m.listeners) == 0 {
+		return []RelayRuleHealth{}
+	}
+	listening := map[string]bool{}
+	if status == "active" && m.cmd != nil && m.cmd.Process != nil {
+		listening = processListeningSockets(m.cmd.Process.Pid)
+	}
+	checkedAt := time.Now().Unix()
+	health := make([]RelayRuleHealth, 0, len(m.listeners))
+	for _, listener := range m.listeners {
+		listenOK := listening[listener.Protocol+":"+strconv.Itoa(listener.ListenPort)]
+		message := ""
+		ruleStatus := "running"
+		if status != "active" {
+			ruleStatus = status
+			message = m.lastError
+		} else if !listenOK {
+			ruleStatus = "failed"
+			message = "GOST 进程未持有该监听端口"
+		}
+		record := RelayRuleHealth{
+			Protocol:   listener.Protocol,
+			ListenHost: listener.ListenHost,
+			ListenPort: listener.ListenPort,
+			Status:     ruleStatus,
+			ListenOK:   listenOK,
+			Message:    message,
+			CheckedAt:  checkedAt,
+		}
+		if listener.Protocol != "tcp" || listener.TargetHost == "" || listener.TargetPort <= 0 {
+			record.TargetStatus = "not_applicable"
+		} else if target, ok := m.targetHealth[relayTargetHealthKey(listener)]; ok {
+			targetOK := target.Status == "reachable"
+			record.TargetStatus = target.Status
+			record.TargetOK = &targetOK
+			record.TargetMessage = target.Message
+			record.TargetCheckedAt = target.CheckedAt
+		} else {
+			record.TargetStatus = "pending"
+		}
+		health = append(health, record)
+	}
+	return health
+}
+
+func (m *RelayManager) scheduleTargetProbesLocked(status string) {
+	if status != "active" || m.targetProbeRunning {
+		return
+	}
+	now := time.Now()
+	if !m.targetProbeAt.IsZero() && now.Sub(m.targetProbeAt) < relayTargetProbeInterval {
+		return
+	}
+	listeners := make([]relayListener, 0, len(m.listeners))
+	for _, listener := range m.listeners {
+		if listener.Protocol == "tcp" && listener.TargetHost != "" && listener.TargetPort > 0 {
+			listeners = append(listeners, listener)
+		}
+	}
+	if len(listeners) == 0 {
+		return
+	}
+	m.targetProbeAt = now
+	m.targetProbeRunning = true
+	go func() {
+		results := probeRelayTargets(listeners)
+		m.mu.Lock()
+		for key, result := range results {
+			m.targetHealth[key] = result
+		}
+		m.targetProbeRunning = false
+		m.mu.Unlock()
+	}()
+}
+
+func probeRelayTargets(listeners []relayListener) map[string]relayTargetHealth {
+	results := make(map[string]relayTargetHealth, len(listeners))
+	var resultMu sync.Mutex
+	var group sync.WaitGroup
+	semaphore := make(chan struct{}, 8)
+	for _, listener := range listeners {
+		listener := listener
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			result := probeRelayTarget(listener, relayTargetProbeTimeout)
+			resultMu.Lock()
+			results[relayTargetHealthKey(listener)] = result
+			resultMu.Unlock()
+		}()
+	}
+	group.Wait()
+	return results
+}
+
+func probeRelayTarget(listener relayListener, timeout time.Duration) relayTargetHealth {
+	result := relayTargetHealth{Status: "unreachable", CheckedAt: time.Now().Unix()}
+	connection, err := net.DialTimeout(
+		"tcp",
+		net.JoinHostPort(strings.Trim(listener.TargetHost, "[]"), strconv.Itoa(listener.TargetPort)),
+		timeout,
+	)
+	if err != nil {
+		result.Message = err.Error()
+		return result
+	}
+	_ = connection.Close()
+	result.Status = "reachable"
+	result.CheckedAt = time.Now().Unix()
+	return result
+}
+
+func relayTargetHealthKey(listener relayListener) string {
+	return strings.Join([]string{
+		listener.Protocol,
+		strings.ToLower(strings.Trim(listener.ListenHost, "[]")),
+		strconv.Itoa(listener.ListenPort),
+		strings.ToLower(strings.Trim(listener.TargetHost, "[]")),
+		strconv.Itoa(listener.TargetPort),
+	}, "|")
 }
 
 func (m *RelayManager) ensureBinaryLocked() error {
@@ -414,6 +585,116 @@ func normalizeRelayRules(rules []RelayRule) []string {
 		}
 	}
 	return nodes
+}
+
+func relayListenersFromNodes(nodes []string) []relayListener {
+	listeners := make([]relayListener, 0, len(nodes))
+	seen := map[string]bool{}
+	for _, node := range nodes {
+		parts := strings.SplitN(node, "://", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		protocol := strings.ToLower(strings.TrimSpace(parts[0]))
+		endpoints := strings.SplitN(parts[1], "/", 2)
+		endpoint := endpoints[0]
+		host, portText, err := net.SplitHostPort(endpoint)
+		if err != nil {
+			continue
+		}
+		port, err := strconv.Atoi(portText)
+		if err != nil || port < 1 || port > 65535 {
+			continue
+		}
+		host = strings.Trim(strings.TrimSpace(host), "[]")
+		if host == "" {
+			host = "0.0.0.0"
+		}
+		targetHost := ""
+		targetPort := 0
+		if len(endpoints) == 2 {
+			parsedHost, parsedPort, targetErr := net.SplitHostPort(endpoints[1])
+			if targetErr == nil {
+				targetHost = strings.Trim(strings.TrimSpace(parsedHost), "[]")
+				targetPort, _ = strconv.Atoi(parsedPort)
+			}
+		}
+		key := protocol + "://" + host + ":" + strconv.Itoa(port)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		listeners = append(listeners, relayListener{
+			Protocol:   protocol,
+			ListenHost: host,
+			ListenPort: port,
+			TargetHost: targetHost,
+			TargetPort: targetPort,
+		})
+	}
+	return listeners
+}
+
+func processListeningSockets(pid int) map[string]bool {
+	result := map[string]bool{}
+	if runtime.GOOS != "linux" || pid <= 0 {
+		return result
+	}
+	inodes := processSocketInodes(pid)
+	if len(inodes) == 0 {
+		return result
+	}
+	for _, table := range []struct {
+		path     string
+		protocol string
+		state    string
+	}{
+		{"/proc/net/tcp", "tcp", "0A"},
+		{"/proc/net/tcp6", "tcp", "0A"},
+		{"/proc/net/udp", "udp", "07"},
+		{"/proc/net/udp6", "udp", "07"},
+	} {
+		file, err := os.Open(table.path)
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+			if len(fields) < 10 || strings.ToUpper(fields[3]) != table.state || !inodes[fields[9]] {
+				continue
+			}
+			address := strings.Split(fields[1], ":")
+			if len(address) != 2 {
+				continue
+			}
+			port, err := strconv.ParseInt(address[1], 16, 32)
+			if err == nil {
+				result[table.protocol+":"+strconv.Itoa(int(port))] = true
+			}
+		}
+		_ = file.Close()
+	}
+	return result
+}
+
+func processSocketInodes(pid int) map[string]bool {
+	inodes := map[string]bool{}
+	entries, err := os.ReadDir(filepath.Join("/proc", strconv.Itoa(pid), "fd"))
+	if err != nil {
+		return inodes
+	}
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "fd", entry.Name()))
+		if err != nil || !strings.HasPrefix(target, "socket:[") || !strings.HasSuffix(target, "]") {
+			continue
+		}
+		inode := strings.TrimSuffix(strings.TrimPrefix(target, "socket:["), "]")
+		if inode != "" {
+			inodes[inode] = true
+		}
+	}
+	return inodes
 }
 
 func normalizeProtocols(values []string) []string {

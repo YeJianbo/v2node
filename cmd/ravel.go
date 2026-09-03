@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -36,6 +37,7 @@ func init() {
 
 func ravelHandle(_ *cobra.Command, _ []string) {
 	agent.SetRuntimeVersion(version)
+	agent.StartNetworkRateSampler()
 	state, err := agent.LoadState(ravelStateFile)
 	if err != nil {
 		log.WithError(err).Fatal("load Ravel state failed")
@@ -101,6 +103,7 @@ func ravelHandle(_ *cobra.Command, _ []string) {
 		snapshot,
 		func(report runtimeApplyReport) {
 			runtimeReady.Store(report.ActiveNodes > 0 || report.RequestedNodes == 0)
+			agent.SetNodeHealth(buildRuntimeNodeHealth(report))
 			controller.MarkConfigApply(report.Status, report.Error)
 			if runtimeReady.Load() && pendingUpdate.TargetVersion == version && binaryPathErr == nil {
 				if err := agent.CompletePendingRavelUpdate(binaryPath); err != nil {
@@ -133,6 +136,44 @@ func ravelHandle(_ *cobra.Command, _ []string) {
 			}
 		}
 	}
+}
+
+func buildRuntimeNodeHealth(report runtimeApplyReport) []agent.NodeHealth {
+	checkedAt := time.Now().Unix()
+	health := make([]agent.NodeHealth, 0, len(report.Snapshot.Nodes)+len(report.Failures))
+	seen := make(map[int]bool, len(report.Snapshot.Nodes))
+	for _, item := range report.Snapshot.Nodes {
+		protocol := ""
+		serverPort := 0
+		if item.Info != nil {
+			protocol = strings.ToLower(strings.TrimSpace(item.Info.Type))
+			if item.Info.Common != nil {
+				serverPort = item.Info.Common.ServerPort
+			}
+		}
+		health = append(health, agent.NodeHealth{
+			NodeID:     item.NodeID,
+			Protocol:   protocol,
+			Status:     "running",
+			ListenOK:   true,
+			CheckedAt:  checkedAt,
+			ServerPort: serverPort,
+		})
+		seen[item.NodeID] = true
+	}
+	for _, failure := range report.Failures {
+		if seen[failure.NodeID] {
+			continue
+		}
+		health = append(health, agent.NodeHealth{
+			NodeID:    failure.NodeID,
+			Status:    "failed",
+			ListenOK:  false,
+			Message:   failure.Stage + ": " + failure.Error,
+			CheckedAt: checkedAt,
+		})
+	}
+	return health
 }
 
 func runRavelLoop(controller *agent.Controller, state agent.State, reloadCh chan<- struct{}, nodeCount int, runtimeReady *atomic.Bool) {
