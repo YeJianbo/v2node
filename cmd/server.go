@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"github.com/wyx2685/v2node/agent"
 	panel "github.com/wyx2685/v2node/api/v2board"
 	"github.com/wyx2685/v2node/conf"
 	"github.com/wyx2685/v2node/core"
@@ -104,7 +106,7 @@ func runServerWithApply(
 ) error {
 	showVersion()
 	log.SetFormatter(&log.TextFormatter{
-		DisableTimestamp: true,
+		DisableTimestamp: !agent.RuntimeUsesOpenRC(),
 		DisableQuote:     true,
 		PadLevelText:     false,
 	})
@@ -326,8 +328,15 @@ func configureRuntimeLogging(configuration *conf.Conf) {
 	}
 
 	oldWriter := log.StandardLogger().Out
-	newWriter := os.Stdout
-	if configuration.LogConfig.Output != "" {
+	var newWriter io.Writer = os.Stdout
+	if agent.RuntimeUsesOpenRC() {
+		writer, err := agent.NewRuntimeLogWriter("ravel")
+		if err == nil {
+			newWriter = writer
+		} else {
+			log.WithError(err).Error("Open runtime log failed")
+		}
+	} else if configuration.LogConfig.Output != "" {
 		file, err := os.OpenFile(configuration.LogConfig.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
 			log.WithField("err", err).Error("Open log file failed, using stdout instead")
@@ -336,7 +345,7 @@ func configureRuntimeLogging(configuration *conf.Conf) {
 		}
 	}
 	log.SetOutput(newWriter)
-	if oldFile, ok := oldWriter.(*os.File); ok && oldFile != os.Stdout && oldFile != os.Stderr && oldFile != newWriter {
+	if oldFile, ok := oldWriter.(io.Closer); ok && oldWriter != os.Stdout && oldWriter != os.Stderr && oldWriter != newWriter {
 		_ = oldFile.Close()
 	}
 }

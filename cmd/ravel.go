@@ -53,6 +53,7 @@ func ravelHandle(_ *cobra.Command, _ []string) {
 		ManagedFile: ravelManagedFile,
 		Relay:       agent.NewRelayManager("/usr/local/ravel/gost", "/etc/.buncloud-agent/relay.json"),
 	}
+	defer controller.Relay.Shutdown()
 	controller.LoadApplyState()
 	snapshot, snapshotErr := controller.LoadRuntimeSnapshot()
 	if snapshotErr != nil && !os.IsNotExist(snapshotErr) {

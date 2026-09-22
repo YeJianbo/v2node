@@ -689,8 +689,12 @@ command_user="root"
 
 pidfile="/run/v2node.pid"
 command_background="yes"
+output_log="/var/log/v2node.log"
+error_log="/var/log/v2node.log"
 
 start_pre() {
+        touch /var/log/v2node.log
+        chmod 600 /var/log/v2node.log
         if [ -f "\$pidfile" ] && ! kill -0 "\$(cat "\$pidfile" 2>/dev/null)" 2>/dev/null; then
                 rm -f "\$pidfile"
         fi
@@ -1024,8 +1028,12 @@ command_args="ravel"
 command_user="root"
 pidfile="/run/ravel.pid"
 command_background="yes"
+output_log="/var/log/ravel.log"
+error_log="/var/log/ravel.log"
 
 start_pre() {
+    touch /var/log/ravel.log
+    chmod 600 /var/log/ravel.log
     if [ -f "\$pidfile" ] && ! kill -0 "\$(cat "\$pidfile" 2>/dev/null)" 2>/dev/null; then
         rm -f "\$pidfile"
     fi

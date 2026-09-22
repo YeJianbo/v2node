@@ -106,23 +106,27 @@ type relayListener struct {
 }
 
 type relayTargetHealth struct {
+	LatencyMs *float64
 	Status    string
 	Message   string
 	CheckedAt int64
 }
 
 type RelayRuleHealth struct {
-	Protocol        string `json:"protocol"`
-	ListenHost      string `json:"listen_host"`
-	ListenPort      int    `json:"listen_port"`
-	Status          string `json:"status"`
-	ListenOK        bool   `json:"listen_ok"`
-	Message         string `json:"message"`
-	CheckedAt       int64  `json:"checked_at"`
-	TargetStatus    string `json:"target_status,omitempty"`
-	TargetOK        *bool  `json:"target_ok,omitempty"`
-	TargetMessage   string `json:"target_message,omitempty"`
-	TargetCheckedAt int64  `json:"target_checked_at,omitempty"`
+	TargetHost      string   `json:"target_host,omitempty"`
+	TargetPort      int      `json:"target_port,omitempty"`
+	TargetLatencyMs *float64 `json:"target_latency_ms,omitempty"`
+	Protocol        string   `json:"protocol"`
+	ListenHost      string   `json:"listen_host"`
+	ListenPort      int      `json:"listen_port"`
+	Status          string   `json:"status"`
+	ListenOK        bool     `json:"listen_ok"`
+	Message         string   `json:"message"`
+	CheckedAt       int64    `json:"checked_at"`
+	TargetStatus    string   `json:"target_status,omitempty"`
+	TargetOK        *bool    `json:"target_ok,omitempty"`
+	TargetMessage   string   `json:"target_message,omitempty"`
+	TargetCheckedAt int64    `json:"target_checked_at,omitempty"`
 }
 
 type RelayManager struct {
@@ -297,6 +301,8 @@ func (m *RelayManager) ruleHealthLocked(status string) []RelayRuleHealth {
 		}
 		record := RelayRuleHealth{
 			Protocol:   listener.Protocol,
+			TargetHost: listener.TargetHost,
+			TargetPort: listener.TargetPort,
 			ListenHost: listener.ListenHost,
 			ListenPort: listener.ListenPort,
 			Status:     ruleStatus,
@@ -312,6 +318,7 @@ func (m *RelayManager) ruleHealthLocked(status string) []RelayRuleHealth {
 			record.TargetOK = &targetOK
 			record.TargetMessage = target.Message
 			record.TargetCheckedAt = target.CheckedAt
+			record.TargetLatencyMs = target.LatencyMs
 		} else {
 			record.TargetStatus = "pending"
 		}
@@ -374,6 +381,7 @@ func probeRelayTargets(listeners []relayListener) map[string]relayTargetHealth {
 
 func probeRelayTarget(listener relayListener, timeout time.Duration) relayTargetHealth {
 	result := relayTargetHealth{Status: "unreachable", CheckedAt: time.Now().Unix()}
+	started := time.Now()
 	connection, err := net.DialTimeout(
 		"tcp",
 		net.JoinHostPort(strings.Trim(listener.TargetHost, "[]"), strconv.Itoa(listener.TargetPort)),
@@ -384,6 +392,8 @@ func probeRelayTarget(listener relayListener, timeout time.Duration) relayTarget
 		return result
 	}
 	_ = connection.Close()
+	elapsed := float64(time.Since(started).Microseconds()) / 1000
+	result.LatencyMs = &elapsed
 	result.Status = "reachable"
 	result.CheckedAt = time.Now().Unix()
 	return result
@@ -461,13 +471,28 @@ func (m *RelayManager) startLocked() error {
 	cmd := exec.Command(m.BinaryPath, "-C", m.ConfigPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	var logFile io.WriteCloser
+	if runtimeOpenRC() {
+		var err error
+		logFile, err = NewRuntimeLogWriter("gost")
+		if err != nil {
+			return fmt.Errorf("open GOST log: %w", err)
+		}
+		cmd.Stdout, cmd.Stderr = logFile, logFile
+	}
 	if err := cmd.Start(); err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		return fmt.Errorf("start GOST: %w", err)
 	}
 	done := make(chan struct{})
 	m.cmd = cmd
 	m.done = done
 	go func() {
+		if logFile != nil {
+			defer logFile.Close()
+		}
 		err := cmd.Wait()
 		close(done)
 		m.mu.Lock()
@@ -514,6 +539,12 @@ func (m *RelayManager) restoreRelayConfigLocked(previous []byte) {
 	if err := m.startAndVerifyLocked(); err != nil {
 		m.lastError = "restore previous relay process: " + err.Error()
 	}
+}
+
+func (m *RelayManager) Shutdown() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stopLocked()
 }
 
 func (m *RelayManager) stopLocked() {

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -102,6 +101,14 @@ func (c *Controller) collectRuntimeStream() *RuntimeStreamChunk {
 	}
 
 	unit := runtimeServiceUnit(config.Service)
+	if runtimeOpenRC() || runtimeHasFileLog(config.Service) {
+		logs, next, err := readRuntimeFile(runtimeLogPath(config.Service), cursor, runtimeStreamMaxChunk)
+		chunk := &RuntimeStreamChunk{SessionID: config.SessionID, Service: config.Service, Logs: logs, CollectedAt: time.Now().Unix(), nextCursor: next}
+		if err != nil {
+			chunk.Error = err.Error()
+		}
+		return chunk
+	}
 	args := []string{"-u", unit, "--no-pager", "-o", "short-iso", "--show-cursor"}
 	if cursor == "" {
 		args = append(args, "-n", "80")
@@ -227,7 +234,7 @@ func executeRuntimeTask(task RuntimeTask, requestReload func() error) RuntimeRes
 
 	switch result.Action {
 	case "logs":
-		output, exitCode, err := runRuntimeCommand(15*time.Second, "journalctl", "-u", unit, "-n", strconv.Itoa(lines), "--no-pager", "-o", "short-iso")
+		output, exitCode, err := readRuntimeLogs(result.Service, lines)
 		result.ExitCode = exitCode
 		result.Logs = tailOutput(output, runtimeMaxOutput)
 		if err != nil {
@@ -238,7 +245,14 @@ func executeRuntimeTask(task RuntimeTask, requestReload func() error) RuntimeRes
 		result.Message = fmt.Sprintf("已读取最近 %d 行日志", lines)
 		return result
 	case "status":
-		output, exitCode, err := runRuntimeCommand(10*time.Second, "systemctl", "show", unit, "--no-pager", "--property=ActiveState,SubState,Result,ExecMainStatus,ExecMainStartTimestamp")
+		var output string
+		var exitCode int
+		var err error
+		if runtimeOpenRC() {
+			output, exitCode, err = runtimeServiceCommand(result.Service, "status")
+		} else {
+			output, exitCode, err = runRuntimeCommand(10*time.Second, "systemctl", "show", unit, "--no-pager", "--property=ActiveState,SubState,Result,ExecMainStatus,ExecMainStartTimestamp")
+		}
 		result.ExitCode = exitCode
 		result.Logs = tailOutput(output, runtimeMaxOutput)
 		if err != nil {
@@ -273,7 +287,7 @@ func executeRuntimeTask(task RuntimeTask, requestReload func() error) RuntimeRes
 		return result
 	}
 
-	output, exitCode, err := runRuntimeCommand(20*time.Second, "systemctl", result.Action, unit)
+	output, exitCode, err := runtimeServiceCommand(result.Service, result.Action)
 	result.ExitCode = exitCode
 	result.Logs = tailOutput(output, runtimeMaxOutput)
 	result.ServiceStatus = serviceActiveState(unit)
@@ -298,6 +312,9 @@ func normalizeRuntimeService(service string) string {
 }
 
 func runtimeServiceUnit(service string) string {
+	if runtimeOpenRC() {
+		return runtimeOpenRCService(service) + ".service"
+	}
 	if service == "gost" {
 		return "gost.service"
 	}
@@ -313,6 +330,13 @@ func serviceUnitExists(unit string) bool {
 }
 
 func serviceActiveState(unit string) string {
+	if runtimeOpenRC() {
+		_, _, err := runRuntimeCommand(5*time.Second, "rc-service", strings.TrimSuffix(unit, ".service"), "status")
+		if err == nil {
+			return "active"
+		}
+		return "inactive"
+	}
 	output, _, err := runRuntimeCommand(5*time.Second, "systemctl", "is-active", unit)
 	state := strings.TrimSpace(output)
 	if state == "" && err != nil {

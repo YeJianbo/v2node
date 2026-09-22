@@ -9,6 +9,7 @@ import (
 )
 
 func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
+	defer c.reportDomainTraffic(ctx)
 	var reportmin = 0
 	var devicemin = 0
 	if c.info.Common.BaseConfig != nil {

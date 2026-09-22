@@ -69,4 +69,7 @@ func TestProbeRelayTargetReportsReachableTCPDestination(t *testing.T) {
 	if result.Status != "reachable" || result.CheckedAt <= 0 {
 		t.Fatalf("probe result = %#v", result)
 	}
+	if result.LatencyMs == nil || *result.LatencyMs < 0 {
+		t.Fatalf("missing connection latency: %#v", result)
+	}
 }

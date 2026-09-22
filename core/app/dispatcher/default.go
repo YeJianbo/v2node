@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/wyx2685/v2node/common/counter"
+	"github.com/wyx2685/v2node/common/domaintraffic"
 	"github.com/wyx2685/v2node/common/rate"
 	"github.com/wyx2685/v2node/limiter"
 
@@ -574,5 +575,17 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 		log.Record(accessMessage)
 	}
 
+	domain := ""
+	if destination.Address.Family().IsDomain() {
+		domain = destination.Address.Domain()
+	}
+	if ob.RouteTarget.IsValid() && ob.RouteTarget.Address.Family().IsDomain() {
+		domain = ob.RouteTarget.Address.Domain()
+	}
+	if counter, release := domaintraffic.Acquire(inTag, domain); counter != nil {
+		defer release()
+		link.Reader = &domainReader{Reader: link.Reader, counter: counter}
+		link.Writer = &domainWriter{Writer: link.Writer, counter: counter}
+	}
 	handler.Dispatch(ctx, link)
 }

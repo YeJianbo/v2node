@@ -7,6 +7,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	panel "github.com/wyx2685/v2node/api/v2board"
+	"github.com/wyx2685/v2node/common/domaintraffic"
 	"github.com/wyx2685/v2node/common/task"
 	"github.com/wyx2685/v2node/conf"
 	"github.com/wyx2685/v2node/core"
@@ -26,6 +27,7 @@ type Controller struct {
 	userReportPeriodic      *task.Task
 	renewCertPeriodic       *task.Task
 	hasCachedRuntime        bool
+	pendingDomains          *panel.DomainTrafficBatch
 }
 
 // NewController return a Node controller with default parameters.
@@ -89,6 +91,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 		log.WithError(aliveErr).Warnf("using cached user limits for %s", c.conf.APIHost)
 	}
 	c.tag = node.Tag
+	domaintraffic.Enable(c.tag, node.Common.BaseConfig != nil && node.Common.BaseConfig.DomainTrafficEnable)
 
 	// add limiter
 	l := limiter.AddLimiter(c.info.Type, c.tag, c.userList, c.aliveMap)
@@ -141,6 +144,7 @@ func (c *Controller) RuntimeSnapshot() CachedNode {
 
 // Close implement the Close() function of the service interface
 func (c *Controller) Close() error {
+	defer domaintraffic.Remove(c.tag)
 	if c.tag != "" {
 		limiter.DeleteLimiter(c.tag)
 	}
