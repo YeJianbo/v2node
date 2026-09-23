@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	panel "github.com/wyx2685/v2node/api/v2board"
@@ -28,6 +29,7 @@ type Controller struct {
 	renewCertPeriodic       *task.Task
 	hasCachedRuntime        bool
 	pendingDomains          *panel.DomainTrafficBatch
+	lastDomainReport        time.Time
 }
 
 // NewController return a Node controller with default parameters.
