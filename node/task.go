@@ -103,14 +103,23 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 
 	// update alive list
 	if newA != nil {
-		c.limiter.AliveList = newA
+		c.limiter.SetAliveList(newA)
 	}
 	// node no changed, check users
-	if len(newU) == 0 {
+	if newU == nil {
 		log.WithField("tag", c.tag).Debug("User list no change")
 		return nil
 	}
 	deleted, added, modified := compareUserList(c.userList, newU)
+	if c.info.Type == "ravel" {
+		if err := c.server.ReplaceRavelUsers(c.tag, newU); err != nil {
+			c.apiClient.InvalidateUserCache()
+			return err
+		}
+		c.limiter.UpdateUser(c.tag, added, deleted, modified)
+		c.userList = newU
+		return nil
+	}
 	if len(deleted) > 0 {
 		// have deleted users
 		err = c.server.DelUsers(deleted, c.tag, c.info)

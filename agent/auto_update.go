@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"net/url"
@@ -171,18 +172,21 @@ func installRavelRelease(ctx context.Context, release githubRelease, binaryPath,
 		return fmt.Errorf("release asset %s was not found", target.AssetName)
 	}
 
-	archive, err := downloadUpdateAsset(ctx, selected.BrowserDownloadURL)
-	if err != nil {
-		return err
-	}
 	digest, err := resolveReleaseAssetDigest(ctx, release, selected)
 	if err != nil {
 		return err
 	}
-	if err := verifyReleaseAssetDigest(archive, digest); err != nil {
+	archive, err := downloadReleaseArchive(ctx, selected.BrowserDownloadURL, filepath.Dir(binaryPath), digest)
+	if err != nil {
 		return err
 	}
-	if err := replaceRavelBinaryEntry(binaryPath, archive, target.BinaryName, func(path string) error {
+	defer os.Remove(archive.Name())
+	defer archive.Close()
+	archiveInfo, err := archive.Stat()
+	if err != nil {
+		return err
+	}
+	if err := replaceRavelBinaryReaderAt(binaryPath, archive, archiveInfo.Size(), target.BinaryName, func(path string) error {
 		return validateRavelBinary(path, release.TagName)
 	}); err != nil {
 		return err
@@ -273,6 +277,58 @@ func downloadUpdateAsset(ctx context.Context, url string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(response.Body, 128<<20))
 }
 
+func downloadReleaseArchive(ctx context.Context, url, directory, digest string) (*os.File, error) {
+	algorithm, expected, ok := strings.Cut(strings.TrimSpace(digest), ":")
+	if !ok || !strings.EqualFold(algorithm, "sha256") {
+		return nil, fmt.Errorf("unsupported release digest %q", digest)
+	}
+	expectedBytes, err := hex.DecodeString(strings.TrimSpace(expected))
+	if err != nil || len(expectedBytes) != sha256.Size {
+		return nil, fmt.Errorf("invalid SHA-256 release digest %q", digest)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("User-Agent", "v2node-ravel-updater")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download release asset returned %s", response.Status)
+	}
+	archive, err := os.CreateTemp(directory, ".ravel-archive-*")
+	if err != nil {
+		return nil, err
+	}
+	valid := false
+	defer func() {
+		if !valid {
+			archive.Close()
+			os.Remove(archive.Name())
+		}
+	}()
+	var checksum hash.Hash = sha256.New()
+	const maxArchiveSize = 128 << 20
+	size, err := io.Copy(io.MultiWriter(archive, checksum), io.LimitReader(response.Body, maxArchiveSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if size > maxArchiveSize {
+		return nil, fmt.Errorf("release archive exceeds %d bytes", maxArchiveSize)
+	}
+	if !bytes.Equal(checksum.Sum(nil), expectedBytes) {
+		return nil, fmt.Errorf("release asset checksum mismatch: expected %s, got %s", expected, hex.EncodeToString(checksum.Sum(nil)))
+	}
+	if err := archive.Sync(); err != nil {
+		return nil, err
+	}
+	valid = true
+	return archive, nil
+}
+
 func resolveReleaseAssetDigest(ctx context.Context, release githubRelease, asset githubAsset) (string, error) {
 	if strings.TrimSpace(asset.Digest) != "" {
 		return asset.Digest, nil
@@ -316,7 +372,11 @@ func replaceRavelBinary(binaryPath string, archive []byte) error {
 }
 
 func replaceRavelBinaryEntry(binaryPath string, archive []byte, binaryName string, validator func(string) error) error {
-	reader, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	return replaceRavelBinaryReaderAt(binaryPath, bytes.NewReader(archive), int64(len(archive)), binaryName, validator)
+}
+
+func replaceRavelBinaryReaderAt(binaryPath string, archive io.ReaderAt, size int64, binaryName string, validator func(string) error) error {
+	reader, err := zip.NewReader(archive, size)
 	if err != nil {
 		return fmt.Errorf("open release archive: %w", err)
 	}

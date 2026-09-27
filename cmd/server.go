@@ -30,7 +30,7 @@ var (
 var serverCommand = cobra.Command{
 	Use:   "server",
 	Short: "Run BunCloud managed agent",
-	Run:   serverHandle,
+	RunE:  func(_ *cobra.Command, _ []string) error { return runServer(config, nil, watch) },
 	Args:  cobra.NoArgs,
 }
 
@@ -69,12 +69,6 @@ func resolveDefaultConfigPath() string {
 		return filepath.Clean(candidates[1])
 	}
 	return "/etc/.buncloud-agent/config.enc.json"
-}
-
-func serverHandle(_ *cobra.Command, _ []string) {
-	if err := runServer(config, nil, watch); err != nil {
-		log.WithError(err).Error("server stopped")
-	}
 }
 
 type runtimeApplyReport struct {

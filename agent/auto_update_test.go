@@ -86,6 +86,51 @@ func TestVerifyReleaseAssetDigest(t *testing.T) {
 	}
 }
 
+func TestDownloadReleaseArchiveStreamsAndVerifies(t *testing.T) {
+	var payload bytes.Buffer
+	zipWriter := zip.NewWriter(&payload)
+	entry, err := zipWriter.Create("v2node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write([]byte("new-binary")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Write(payload.Bytes())
+	}))
+	defer server.Close()
+	directory := t.TempDir()
+	digest := sha256.Sum256(payload.Bytes())
+	archive, err := downloadReleaseArchive(context.Background(), server.URL, directory, "sha256:"+hex.EncodeToString(digest[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(archive.Name())
+	defer archive.Close()
+	info, err := archive.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryPath := filepath.Join(directory, "ravel")
+	if err := os.WriteFile(binaryPath, []byte("old-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceRavelBinaryReaderAt(binaryPath, archive, info.Size(), "v2node", nil); err != nil {
+		t.Fatal(err)
+	}
+	current, err := os.ReadFile(binaryPath)
+	if err != nil || string(current) != "new-binary" {
+		t.Fatalf("unexpected new binary %q: %v", current, err)
+	}
+	if _, err := downloadReleaseArchive(context.Background(), server.URL, directory, "sha256:"+hex.EncodeToString(make([]byte, sha256.Size))); err == nil {
+		t.Fatal("invalid checksum was accepted")
+	}
+}
+
 func TestRavelVersionOutputMustMatchReleaseTag(t *testing.T) {
 	if !ravelVersionOutputMatches("ravel v1.2.3 (Ravel integrated node runtime)", "v1.2.3") {
 		t.Fatal("matching Ravel version output was rejected")

@@ -135,6 +135,7 @@ type RelayManager struct {
 
 	mu                 sync.Mutex
 	cmd                *exec.Cmd
+	embedded           *embeddedRelay
 	done               chan struct{}
 	version            string
 	ruleCount          int
@@ -169,7 +170,7 @@ func (m *RelayManager) Sync(config RelayConfig) (bool, error) {
 
 	nodes := normalizeRelayRules(config.Rules)
 	if len(nodes) == 0 {
-		changed := m.cmd != nil
+		changed := m.cmd != nil || m.embedded != nil
 		m.stopLocked()
 		if err := os.Remove(m.ConfigPath); err == nil {
 			changed = true
@@ -179,9 +180,11 @@ func (m *RelayManager) Sync(config RelayConfig) (bool, error) {
 		m.lastError = ""
 		return changed, nil
 	}
-	if err := m.ensureBinaryLocked(); err != nil {
-		m.lastError = err.Error()
-		return false, err
+	if !m.useEmbedded() {
+		if err := m.ensureBinaryLocked(); err != nil {
+			m.lastError = err.Error()
+			return false, err
+		}
 	}
 
 	raw, err := json.MarshalIndent(gostConfig{ServeNodes: nodes}, "", "  ")
@@ -199,7 +202,7 @@ func (m *RelayManager) Sync(config RelayConfig) (bool, error) {
 		}
 		m.stopLocked()
 	}
-	if m.cmd == nil {
+	if m.cmd == nil && m.embedded == nil {
 		if err := m.startAndVerifyLocked(); err != nil {
 			if changed {
 				m.restoreRelayConfigLocked(current)
@@ -217,6 +220,9 @@ func (m *RelayManager) Sync(config RelayConfig) (bool, error) {
 func (m *RelayManager) StartExisting() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.embedded != nil {
+		return nil
+	}
 
 	if m.cmd != nil && m.cmd.Process != nil {
 		if m.done == nil {
@@ -245,9 +251,11 @@ func (m *RelayManager) StartExisting() error {
 	if len(config.ServeNodes) == 0 {
 		return nil
 	}
-	if err := m.ensureBinaryLocked(); err != nil {
-		m.lastError = err.Error()
-		return err
+	if !m.useEmbedded() {
+		if err := m.ensureBinaryLocked(); err != nil {
+			m.lastError = err.Error()
+			return err
+		}
 	}
 	if err := m.startAndVerifyLocked(); err != nil {
 		m.lastError = err.Error()
@@ -263,7 +271,7 @@ func (m *RelayManager) Status() map[string]any {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	status := "inactive"
-	if m.cmd != nil && m.cmd.Process != nil {
+	if m.embedded != nil || (m.cmd != nil && m.cmd.Process != nil) {
 		status = "active"
 	} else if m.lastError != "" {
 		status = "failed"
@@ -283,7 +291,9 @@ func (m *RelayManager) ruleHealthLocked(status string) []RelayRuleHealth {
 		return []RelayRuleHealth{}
 	}
 	listening := map[string]bool{}
-	if status == "active" && m.cmd != nil && m.cmd.Process != nil {
+	if status == "active" && m.embedded != nil {
+		listening = m.embedded.listening
+	} else if status == "active" && m.cmd != nil && m.cmd.Process != nil {
 		listening = processListeningSockets(m.cmd.Process.Pid)
 	}
 	checkedAt := time.Now().Unix()
@@ -468,6 +478,22 @@ func (m *RelayManager) readVersionLocked() {
 }
 
 func (m *RelayManager) startLocked() error {
+	if m.useEmbedded() {
+		raw, err := os.ReadFile(m.ConfigPath)
+		if err != nil {
+			return err
+		}
+		var config gostConfig
+		if err := json.Unmarshal(raw, &config); err != nil {
+			return err
+		}
+		m.embedded, err = startEmbeddedRelay(config.ServeNodes)
+		if err != nil {
+			return err
+		}
+		m.version = "embedded"
+		return nil
+	}
 	cmd := exec.Command(m.BinaryPath, "-C", m.ConfigPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -512,6 +538,9 @@ func (m *RelayManager) startAndVerifyLocked() error {
 	if err := m.startLocked(); err != nil {
 		return err
 	}
+	if m.embedded != nil {
+		return nil
+	}
 	done := m.done
 	if done == nil {
 		return fmt.Errorf("GOST did not expose a process handle")
@@ -548,6 +577,10 @@ func (m *RelayManager) Shutdown() {
 }
 
 func (m *RelayManager) stopLocked() {
+	if m.embedded != nil {
+		m.embedded.Close()
+		m.embedded = nil
+	}
 	if m.cmd == nil || m.cmd.Process == nil {
 		return
 	}
@@ -561,6 +594,10 @@ func (m *RelayManager) stopLocked() {
 	}
 	m.cmd = nil
 	m.done = nil
+}
+
+func (m *RelayManager) useEmbedded() bool {
+	return os.Getenv("RAVEL_EMBEDDED_RELAY") == "1"
 }
 
 func (m *RelayManager) cleanupLegacyLocked() {

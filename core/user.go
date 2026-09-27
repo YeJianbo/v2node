@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -48,7 +49,14 @@ func (v *V2Core) GetUserManager(tag string) (proxy.UserManager, error) {
 	return userManager, nil
 }
 
-func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo) error {
+func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, info *panel.NodeInfo) error {
+	if info != nil && info.Type == "ravel" {
+		runtime, err := vc.getRavelRuntime(tag)
+		if err != nil {
+			return err
+		}
+		return runtime.delUsers(users)
+	}
 	userManager, err := vc.GetUserManager(tag)
 	if err != nil {
 		return fmt.Errorf("get user manager error: %s", err)
@@ -79,6 +87,9 @@ func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo
 }
 
 func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserTraffic, error) {
+	if runtime, ok := vc.lookupRavelRuntime(tag); ok {
+		return runtime.trafficSlice(mintraffic), nil
+	}
 	trafficSlice := make([]panel.UserTraffic, 0)
 	vc.users.mapLock.RLock()
 	defer vc.users.mapLock.RUnlock()
@@ -113,6 +124,19 @@ func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserT
 }
 
 func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
+	if p == nil || p.NodeInfo == nil {
+		return 0, errors.New("add users parameters are incomplete")
+	}
+	if p.NodeInfo.Type == "ravel" {
+		runtime, err := v.getRavelRuntime(p.Tag)
+		if err != nil {
+			return 0, err
+		}
+		if err := runtime.addUsers(p.Users); err != nil {
+			return 0, err
+		}
+		return len(p.Users), nil
+	}
 	v.users.mapLock.Lock()
 	defer v.users.mapLock.Unlock()
 	for i := range p.Users {

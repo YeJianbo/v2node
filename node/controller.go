@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	panel "github.com/wyx2685/v2node/api/v2board"
@@ -27,7 +28,9 @@ type Controller struct {
 	userReportPeriodic      *task.Task
 	renewCertPeriodic       *task.Task
 	hasCachedRuntime        bool
+	pendingTraffic          []panel.UserTraffic
 	pendingDomains          *panel.DomainTrafficBatch
+	lastDomainReport        time.Time
 }
 
 // NewController return a Node controller with default parameters.
@@ -69,7 +72,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 	// Update user
 	users, userErr := c.apiClient.GetUserList(context.Background())
 	if userErr == nil {
-		if len(users) == 0 {
+		if len(users) == 0 && node.Type != "ravel" {
 			return errors.New("add users error: not have any user")
 		}
 		c.userList = users
@@ -79,7 +82,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 	} else {
 		log.WithError(userErr).Warnf("using cached users for %s", c.conf.APIHost)
 	}
-	if len(c.userList) == 0 {
+	if len(c.userList) == 0 && node.Type != "ravel" {
 		return errors.New("add users error: not have any user")
 	}
 	alive, aliveErr := c.apiClient.GetUserAlive(context.Background())

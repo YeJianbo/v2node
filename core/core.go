@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
@@ -34,6 +35,8 @@ type V2Core struct {
 	ihm        inbound.Manager
 	ohm        outbound.Manager
 	dispatcher *dispatcher.DefaultDispatcher
+	ravelMu    sync.RWMutex
+	ravel      map[string]*ravelRuntime
 }
 
 type UserMap struct {
@@ -47,6 +50,7 @@ func New(config *conf.Conf) *V2Core {
 		users: &UserMap{
 			uidMap: make(map[string]int),
 		},
+		ravel: make(map[string]*ravelRuntime),
 	}
 	return core
 }
@@ -67,15 +71,30 @@ func (v *V2Core) Start(infos []*panel.NodeInfo) error {
 func (v *V2Core) Close() error {
 	v.access.Lock()
 	defer v.access.Unlock()
+	var closeErrors []error
+	v.ravelMu.Lock()
+	runtimes := make([]*ravelRuntime, 0, len(v.ravel))
+	for tag, runtime := range v.ravel {
+		runtimes = append(runtimes, runtime)
+		delete(v.ravel, tag)
+	}
+	v.ravelMu.Unlock()
+	for _, runtime := range runtimes {
+		if err := runtime.close(); err != nil {
+			closeErrors = append(closeErrors, err)
+		}
+	}
 	v.Config = nil
 	v.ihm = nil
 	v.ohm = nil
 	v.dispatcher = nil
-	err := v.Server.Close()
-	if err != nil {
-		return err
+	if v.Server != nil {
+		if err := v.Server.Close(); err != nil {
+			closeErrors = append(closeErrors, err)
+		}
+		v.Server = nil
 	}
-	return nil
+	return errors.Join(closeErrors...)
 }
 
 func getCore(c *conf.Conf, infos []*panel.NodeInfo) *core.Instance {

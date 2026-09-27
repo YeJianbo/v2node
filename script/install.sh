@@ -728,6 +728,7 @@ LimitRSS=infinity
 LimitCORE=infinity
 LimitNOFILE=999999
 WorkingDirectory=/usr/local/v2node/
+Environment=GODEBUG=http2xconnect=1
 ExecStart=/usr/local/v2node/run.sh
 Restart=always
 RestartSec=10
@@ -1066,6 +1067,7 @@ Wants=network.target
 Type=simple
 User=root
 Group=root
+Environment=GODEBUG=http2xconnect=1
 ExecStart=/usr/local/ravel/ravel ravel
 Restart=always
 RestartSec=5

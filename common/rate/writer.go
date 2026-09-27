@@ -30,6 +30,10 @@ func (d *DynamicBucket) Get() *ratelimit.Bucket {
 }
 
 func (d *DynamicBucket) Update(rate int64) {
+	if rate <= 0 {
+		d.v.Store((*ratelimit.Bucket)(nil))
+		return
+	}
 	newB := ratelimit.NewBucketWithQuantum(time.Second, rate, rate)
 	d.v.Store(newB)
 }

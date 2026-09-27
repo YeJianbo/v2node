@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/wyx2685/v2node/common/domaintraffic"
+	"time"
 )
 
 type DomainTrafficBatch struct {
@@ -13,7 +14,10 @@ type DomainTrafficBatch struct {
 }
 
 func (c *Client) ReportDomainTraffic(ctx context.Context, batch *DomainTrafficBatch) error {
-	r, err := c.client.R().SetContext(ctx).SetBody(batch).Post("/api/v2/server/domainTraffic")
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	// The controller retains the batch and retries on the next reporting window.
+	r, err := c.client.Clone().SetRetryCount(0).R().SetContext(ctx).SetBody(batch).Post("/api/v2/server/domainTraffic")
 	if err != nil {
 		return fmt.Errorf("domain traffic transport failed")
 	}
