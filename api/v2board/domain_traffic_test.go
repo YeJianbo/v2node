@@ -2,10 +2,11 @@ package panel
 
 import (
 	"context"
-	"github.com/go-resty/resty/v2"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/go-resty/resty/v2"
 )
 
 func TestDomainReportDoesNotUseGeneralRetries(t *testing.T) {
