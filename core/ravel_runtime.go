@@ -361,7 +361,8 @@ func (runtime *ravelRuntime) authorize(auth ravel.AuthContext) bool {
 	_, ok := runtime.activeAuth[auth]
 	credential, exists := runtime.activeCredentials[auth]
 	runtime.authMu.RUnlock()
-	return ok && exists && credential.ValidateAt(time.Now(), runtime.config.gatewayGroup) == nil
+	now := time.Now()
+	return ok && exists && now.Unix() < int64(credential.NotAfter) && credential.ValidateAt(now, runtime.config.gatewayGroup) == nil
 }
 
 func (runtime *ravelRuntime) setActiveCredentialsLocked(credentials []ravel.Credential) {
@@ -487,6 +488,7 @@ func buildRavelCredentialSnapshot(
 		activeUUID: make(map[ravel.AuthContext]string),
 		users:      make(map[string]panel.UserInfo, len(users)),
 	}
+	owners := make(map[int]bool, len(users))
 	for userIndex := range users {
 		user := users[userIndex]
 		if user.Id <= 0 {
@@ -495,6 +497,10 @@ func buildRavelCredentialSnapshot(
 		if user.Uuid == "" {
 			return ravelCredentialSnapshot{}, fmt.Errorf("ravel user %d has an empty UUID", user.Id)
 		}
+		if owners[user.Id] {
+			return ravelCredentialSnapshot{}, fmt.Errorf("duplicate ravel user ID %d", user.Id)
+		}
+		owners[user.Id] = true
 		if _, exists := snapshot.users[user.Uuid]; exists {
 			return ravelCredentialSnapshot{}, fmt.Errorf("duplicate ravel user UUID %q", user.Uuid)
 		}

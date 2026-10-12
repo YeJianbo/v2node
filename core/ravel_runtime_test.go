@@ -17,6 +17,7 @@ import (
 	"github.com/YeJianbo/ravel-go/carrier"
 	"github.com/YeJianbo/ravel-go/client"
 	panel "github.com/wyx2685/v2node/api/v2board"
+	"github.com/wyx2685/v2node/limiter"
 )
 
 func TestRavelRuntimeRotationRevocationAndMetering(t *testing.T) {
@@ -63,6 +64,9 @@ func TestRavelRuntimeRotationRevocationAndMetering(t *testing.T) {
 	}
 	first, second := makeCredential(1), makeCredential(2)
 	user := panel.UserInfo{Id: 42, Uuid: "user-42", RavelCredentials: []panel.RavelCredential{first}}
+	limiter.Init()
+	runtime.limiter = limiter.AddLimiter("ravel", "rotation-test", []panel.UserInfo{user}, map[int]int{})
+	runtime.config.tag = "rotation-test"
 	if err := runtime.replaceUsers([]panel.UserInfo{user}); err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +102,7 @@ func TestRavelRuntimeRotationRevocationAndMetering(t *testing.T) {
 		}
 	}()
 	target := netip.MustParseAddrPort(echo.Addr().String())
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	oldClient := newClient(first)
 	conn, err := oldClient.Open(ctx, target.Addr().String(), target.Port())
@@ -117,10 +121,14 @@ func TestRavelRuntimeRotationRevocationAndMetering(t *testing.T) {
 	if !bytes.Equal(payload, reply) {
 		t.Fatal("payload changed")
 	}
-	user.RavelCredentials = []panel.RavelCredential{first, second}
+	overlap := first
+	overlap.NotAfter = time.Now().Unix() + 3
+	user.Uuid = "rotated-user-42"
+	user.RavelCredentials = []panel.RavelCredential{second, overlap}
 	if err := runtime.replaceUsers([]panel.UserInfo{user}); err != nil {
 		t.Fatal(err)
 	}
+	runtime.limiter.ReplaceRavelUsers(runtime.config.tag, []panel.UserInfo{user})
 	newer := newClient(second)
 	next, err := newer.Open(ctx, target.Addr().String(), target.Port())
 	if err != nil {
@@ -145,18 +153,24 @@ func TestRavelRuntimeRotationRevocationAndMetering(t *testing.T) {
 	if up != int64(len(payload)) || down != up {
 		t.Fatalf("traffic = %d/%d, want %d each", up, down, len(payload))
 	}
+	// No further panel update: local expiry must close an already-open old carrier.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expired carrier was not closed")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("local credential expiry timed out")
+	}
+	if _, err := oldClient.Open(ctx, target.Addr().String(), target.Port()); err == nil {
+		t.Fatal("expired credential still connected")
+	}
+	fresh, err := newer.Open(ctx, target.Addr().String(), target.Port())
+	if err != nil {
+		t.Fatal("new credential expired with the old one", err)
+	}
+	fresh.Close()
 	user.RavelCredentials = []panel.RavelCredential{second}
 	if err := runtime.replaceUsers([]panel.UserInfo{user}); err != nil {
 		t.Fatal(err)
-	}
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := conn.Read(make([]byte, 1)); err == nil {
-		t.Fatal("revoked carrier was not closed")
-	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
-		t.Fatal("revocation timed out")
-	}
-	if _, err := oldClient.Open(ctx, target.Addr().String(), target.Port()); err == nil {
-		t.Fatal("revoked credential still connected")
 	}
 	if err := runtime.replaceUsers(nil); err != nil {
 		t.Fatal(err)

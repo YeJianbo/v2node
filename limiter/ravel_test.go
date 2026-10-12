@@ -61,3 +61,29 @@ func TestRavelLimitConcurrentAdmissionAndUpdates(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+func TestRavelUUIDRotationPreservesSharedBucketAndDeviceReservation(t *testing.T) {
+	Init()
+	user := panel.UserInfo{Id: 42, Uuid: "old-uuid", SpeedLimit: 1, DeviceLimit: 1}
+	limit := AddLimiter("ravel", "rotation", []panel.UserInfo{user}, map[int]int{})
+	bucket, rejected := limit.CheckLimit(format.UserTag("rotation", user.Uuid), "192.0.2.1", true)
+	if rejected || bucket == nil {
+		t.Fatal("initial identity unavailable")
+	}
+	user.Uuid = "new-uuid"
+	limit.ReplaceRavelUsers("rotation", []panel.UserInfo{user})
+	next, rejected := limit.CheckLimit(format.UserTag("rotation", user.Uuid), "192.0.2.1", true)
+	if rejected || next != bucket {
+		t.Fatal("rotation reset the shared rate bucket or device slot")
+	}
+	if _, rejected := limit.CheckLimit(format.UserTag("rotation", user.Uuid), "192.0.2.2", true); !rejected {
+		t.Fatal("second device bypassed one-device limit")
+	}
+	if _, rejected := limit.CheckLimit(format.UserTag("rotation", "old-uuid"), "192.0.2.1", true); !rejected {
+		t.Fatal("obsolete UUID retained a separate limiter")
+	}
+	online, err := limit.GetOnlineDevice()
+	if err != nil || len(*online) != 1 || (*online)[0].UID != 42 {
+		t.Fatal("rotation duplicated online owner")
+	}
+}

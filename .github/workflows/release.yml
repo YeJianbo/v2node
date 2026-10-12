@@ -99,6 +99,12 @@ jobs:
     steps:
       - name: Checkout codebase
         uses: actions/checkout@v5
+      - name: Checkout Ravel core
+        uses: actions/checkout@v5
+        with:
+          repository: YeJianbo/ravel-go
+          ref: 24138bf0c639b5fb21d7cf8268ece2d41bfdc3df
+          path: .ravel-core
       - name: Show workflow information
         id: get_filename
         run: |
@@ -109,11 +115,17 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.26.1'
+          go-version-file: go.mod
 
       - name: Get project dependencies
         run: |
+          go mod edit -replace=github.com/YeJianbo/ravel-go=./.ravel-core
           go mod download
+      - name: Test Ravel runtime
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        env:
+          GODEBUG: http2xconnect=1
+        run: go test ./api/v2board ./limiter ./core ./node
       - name: Get release version
         if: ${{ github.event_name == 'release' }}
         run: |

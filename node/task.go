@@ -116,7 +116,7 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 			c.apiClient.InvalidateUserCache()
 			return err
 		}
-		c.limiter.UpdateUser(c.tag, added, deleted, modified)
+		c.limiter.ReplaceRavelUsers(c.tag, newU)
 		c.userList = newU
 		return nil
 	}

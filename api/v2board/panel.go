@@ -15,6 +15,7 @@ import (
 )
 
 const ravelServerCapability = "ravel_server_v1"
+const ravelOverlapCapability = "ravel_credential_overlap_v1"
 
 // Panel is the interface for different panel's api.
 
@@ -89,9 +90,10 @@ func New(c *conf.NodeConfig) (*Client, error) {
 
 func panelUserAgent() string {
 	return fmt.Sprintf(
-		"v2node go-resty/%s capability/%s (https://github.com/go-resty/resty)",
+		"v2node go-resty/%s capability/%s capability/%s (https://github.com/go-resty/resty)",
 		resty.Version,
 		ravelServerCapability,
+		ravelOverlapCapability,
 	)
 }
 
